@@ -1,0 +1,291 @@
+Installation
+------------
+
+Currently only supports x64 build.
+
+Follow the directions to download chromium source code here:
+http://www.chromium.org/developers/how-tos/get-the-code. If you have any
+problems during these four steps, you should read the documentation about how
+to get the code. Loosely, the steps are:
+
+    1. Install depot_tools
+
+       git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+       export PATH="$PATH:/path/to/depot_tools"
+
+    2. Fetch chromium
+
+       mkdir chromium
+       cd chromium
+       fetch --nohooks chromium
+
+    3. [Linux only] You may have to install the build dependencies
+
+       sh src/build/install-build-deps.sh
+
+    4. Run hooks
+
+       cd src
+       gclient --runhooks
+
+
+Then continue following the directions here.
+
+
+On linux, you may also need to install libgcrypt11 manually since it is not in
+the apt sources anymore. I got it from here
+https://launchpad.net/ubuntu/trusty/amd64/libgcrypt11/1.5.3-2ubuntu4. Download
+the libgcrypt11[versionstuff].deb file and then run:
+
+  sudo dpkg -I libgcrypt11[versionstuff].deb
+
+
+Building capnp for chrome
+-------------------------
+
+You must have Capn' Proto installed and the capnp tool must be in your path.
+https://capnproto.org. Go to the installation section and read the directions
+there. Download version 0.5.3.
+
+On osx, previously, I had no problem following the given directions for
+installation.
+
+However, on linux, you may have to do this:
+
+First you have to clone from git. Substitute the following commands in the
+installation for compilation. You need to compile the library with the same
+toolchain that chromium users. Ideally, this would be a BUILD.gn file but I
+haven't done that yet.
+
+If the build fails at the configuration step, check the config.log file. First,
+you will need to apply the patch for supporting the libc++ stdlib 4.6.3 which
+does not have a version of std::chrono::stead_clock. The patch is found in
+v8/src/taint_tracking/capnp-diff.patch. If you don't use the same tool chain,
+then during linking you will get undefined references during the ninja build.
+These flags come from running the building with the verbose flag in ninja and
+looking at the arguments that are passed to compilation. The sysroot flag may
+need to be changed depending on what system you're on.
+
+  patch -p1 < v8/src/taint_tracking/capnp-diff.patch
+  # Change this to point to the installation directory
+  export CHROMEDIR="/home/billy/docs/source/chromium_taint_tracking/src";
+
+  export SYSROOT="$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot"
+  export CXX="$CHROMEDIR/third_party/llvm-build/Release+Asserts/bin/clang++";
+  export CC="$CHROMEDIR/third_party/llvm-build/Release+Asserts/bin/clang"
+
+  # -D_GLIBCXX_USE_CLOCK_REALTIME is required because of a bug in the version
+  # of the libc++ library on linux that ships with chromium:
+  # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53841 If you forget this, you
+  # may get bugs during configure about not supporting the C++11 standard
+  # library
+  export CXXFLAGS="--sysroot=$SYSROOT -O3 -B$CHROMEDIR/third_party/binutils/Linux_x64/Release/bin -std=c++11 -D_GLIBCXX_USE_CLOCK_REALTIME";
+
+  export LDFLAGS="-B$CHROMEDIR/third_party/binutils/Linux_x64/Release/bin"
+
+
+  export LDFLAGS="-L$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/lib/x86_64-linux-gnu -Wl,-rpath-link=$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/lib/x86_64-linux-gnu -L$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/usr/lib/x86_64-linux-gnu -Wl,-rpath-link=$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/usr/lib/x86_64-linux-gnu -L$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/usr/lib -Wl,-rpath-link=$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/usr/lib -Wl,-rpath-link=$CHROMEDIR/out/Debug -B$CHROMEDIR/third_party/binutils/Linux_x64/Release/bin -L$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/4.6 -Wl,-rpath-link=$CHROMEDIR/build/linux/debian_wheezy_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/4.6"
+
+  cd c++
+  autoreconf -i
+  # Change this to install where you want. Make sure that you give the same
+  # path to the compilation step below.
+  ./configure --with-sysroot="$SYSROOT" --prefix="/home/billy/projects/capnproto-install-clang"
+  make -j8 check
+  sudo make install
+
+
+
+Checking out code
+-----------------
+
+You must also make sure that chromium and all its libraries are built with the
+same version as the v8 code checkout. There is a list of checkout commits for
+the current version. Then, you may need to run the hooks after doing this:
+
+cd <root>;
+gclient --runhooks
+
+gclient checkout 8d0c21dddbe95f83dc7323d749a9bcff9a84e020
+gclient sync --with_branch_heads
+git apply /path/to/chromium_patch
+cd v8
+patch -p1 /path/to/v8_patch
+
+
+Note about gclient sync: In my version of gclient, I encountered the issue here:
+https://groups.google.com/forum/#!topic/discuss-webrtc/tOhttHQoTsg. The solution
+presented in that post built correctly. Note about using patch -p1 for v8: for
+some reason, git apply did not work on this.
+
+
+
+Compiling
+---------
+
+First create an output dir with gn gen <outdir>. On linux, you may also need to
+set the pkg-config path environment variable before this step. If you don't do
+this, it will complain that it requires a specific version of the randrproto
+library.
+
+export PKG_CONFIG_PATH="./build/linux/ubuntu_precise_amd64-sysroot/usr/share/pkgconfig"
+
+If you installed capnp into a directory that is not on your path (you likely
+did this if you used the --prefix) argument, then you need to add the bin
+directory of capnp to your path using this environment variable. If you don't
+do this, you will get an error during the capnp compiling step. You also need
+to set the LD_LIBRARY_PATH during runtime or else you will get an error that it
+cannot find libcapnp[version].so.
+
+# Change this to your directory
+export CAPNP_INSTALL="/home/billy/projects/capnproto-install-clang"
+export PATH="$PATH:$CAPNP_INSTALL/bin"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$CAPNP_INSTALL/lib"
+
+Required build parameters. Set these via "gn args <outdir>"
+
+  v8_interpreted_regexp = true
+
+Suggested build parameters for development:
+
+  is_component_build = true
+
+  # Set this to 0 to disable symbols
+  symbol_level = 1
+  enable_nacl = false
+  remove_webcore_debug_symbols = false
+  is_debug = true
+
+
+You may need to set the capnp location in the arguments as well. This should
+point to a directory which has the capnp library in the lib subdirectory. For
+unix-es, the default install is in "/usr/local" if installed from source. If
+you change this directory via --prefix during configure time, it will be
+different.
+
+  v8_capnp_include_dir = "/home/billy/projects/capnproto-install-clang"
+
+
+Then run the build command:
+
+ninja -C out/Debug <buildtarget>
+
+e.g:
+ninja -C out/Debug chrome
+
+
+On request, we can provide a virtual box that has the code checked out and
+compiling for reference.
+
+
+
+Running Tests
+-------------
+
+Run from the root directory:
+
+v8/tools/run-tests.py --mode=debug --arch=x64 cctest/test-taint-tracking/\* --shell-dir=$(pwd)/out/Debug
+
+
+
+Common issues
+-------------
+
+Sometimes if you change portions of the taint tracking code and then recompile,
+things don't work because of deserialization issues with previously JIT-ed
+code. Recommend performing a clean build if you run into issues.
+
+  ninja -C out/Debug -t clean
+
+Also, it will help to remove the cache directories and user data directories
+for chromium. On linux they are typically in ~/.cache/chromium and
+~/.config/chromium.
+
+
+
+Running
+-------
+
+To pass command line arguments to the v8 process, you must call the chrome
+executable with the --js-flags="<v8 arguments>" flag. The
+v8/src/flag-definitions.h file has up to date arguments. The executable is in
+the out/Debug or out/Release directory. You must have the LD_LIBRARY_PATH
+environment variable still defined, otherwise it will complain that it cannot
+find libcapnp.
+
+
+
+Flags:
+
+--taint_log_file : A prefix for log files to be sent to. For example
+  /home/billy/log_file will write to files with this format
+  /home/billy/log_file_[current process id]_[current time millis]_[isolate
+  counter]. It does a best effort way of making sure there are not other files
+  there, but it may overwrite anything with the same prefix.
+
+--taint_tracking_enable_symbolic : Enable logging the symbolic values of
+  strings. This will not output symbolic values of control flow, just the
+  makeup of strings.
+
+--taint_tracking_enable_export_ast : Enable exporting the AST to the log. This
+  is required for --taint_tracking_enable_ast_modification.
+
+--taint_tracking_enable_source_export : Enable exporting source code along with
+  the parsed AST. Requires --taint_tracking_enable_export_ast.
+
+--taint_tracking_enable_ast_modification : Enable modifying the AST to insert
+  runtime checks during runtime at each AST node. This is required for concolic
+  execution. Requires --taint_tracking_enable_export_ast.
+
+--taint_tracking_enable_concolic : Enable concolic execution. Requires the
+  --js-flags of --no-crankshaft --no-turbo and --no-ignition be specified.
+
+--taint_tracking_enable_message_origin_check : Enable checking which
+  cross-origin messages have checked the origin using the == or != and strict
+  operator variants.
+
+
+Examples:
+
+LD_LIBRARY_PATH="/home/billy/projects/capnproto-install-clang/lib" out/Debug/chrome --js-flags="--taint_log_file=/home/billy/logfile_prefix" --no-sandbox --renderer-cmd-prefix='xterm -title renderer -e gdb -ex run --args'
+
+
+out/Debug/chrome --js-flags="--taint_log_file=/home/billy/test_google_v12 --taint_tracking_enable_export_ast --taint_tracking_enable_concolic --no-crankshaft --no-turbo --no-ignition" --no-sandbox --disable-hang-monitor
+
+
+Useful other arguments for chrome:
+
+--no-sandbox: may be required to write files from --taint_log_file on linux.
+
+--disable-hang-monitor: useful to stop the pesky kill tab dialogs
+
+--renderer-cmd-prefix: useful to debug renderer processes like:
+  --renderer-cmd-prefix='xterm -title renderer -e gdb -ex run --args'
+
+  or
+
+  --renderer-cmd-prefix='gnome-terminal --disable-factory -x gdb -ex run --args'
+
+--renderer-startup-dialog: allows you to connect to processes using gdb or lldb
+  after creation. It will print the process id of the renderer process and
+  pause it until a debugger connects.
+
+
+
+Debugging
+---------
+
+Chromium documentation about debugging on linux:
+
+https://chromium.googlesource.com/chromium/src/+/master/docs/linux_debugging.md#GDB
+
+Useful command for debugging the renderer process in gdb. Its hard to catch the
+renderer process because chrome spawns them off in separate processes. Here is
+a command to start up a new xterm with the gdb process for the spawned
+processes.
+
+It can be hard to debug memory error in the taint tracking system because its
+difficult to localize where a memory error was introduced. With a debug build,
+you can use the --taint_tracking_enable_export_ast and
+--taint_tracking_enable_modify_ast to get more information about when an error
+was introduced.

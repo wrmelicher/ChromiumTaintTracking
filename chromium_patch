@@ -1,0 +1,2550 @@
+From ebf3537036a7cdb114d7875fb79458de11fd1205 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Sat, 17 Dec 2016 13:07:27 -0500
+Subject: [PATCH 01/11] Adding support for webkit to check and set taint
+
+current version only sets taint on url's and checks taint for innerhtml/outerhtml
+---
+ .../static_v8_external_one_byte_string_resource.h  |  3 +-
+ net/proxy/proxy_resolver_v8.cc                     |  6 ++-
+ .../WebKit/Source/bindings/core/v8/ScriptState.cpp | 24 +++++++++
+ .../WebKit/Source/bindings/core/v8/ScriptState.h   |  2 +
+ .../Source/bindings/core/v8/V8StringResource.cpp   | 23 ++++++++-
+ .../Source/bindings/core/v8/V8StringResource.h     | 22 +++++++-
+ third_party/WebKit/Source/core/dom/Element.cpp     | 22 ++++++++
+ third_party/WebKit/Source/core/dom/Element.h       |  6 +++
+ third_party/WebKit/Source/core/dom/Element.idl     |  4 +-
+ third_party/WebKit/Source/core/frame/Location.cpp  | 37 +++++++++++---
+ third_party/WebKit/Source/wtf/text/StringImpl.cpp  | 15 ++++--
+ third_party/WebKit/Source/wtf/text/StringImpl.h    |  7 ++-
+ .../WebKit/Source/wtf/text/TaintTracking.cpp       | 38 ++++++++++++++
+ third_party/WebKit/Source/wtf/text/TaintTracking.h | 59 ++++++++++++++++++++++
+ third_party/WebKit/Source/wtf/wtf.gypi             |  2 +
+ 15 files changed, 250 insertions(+), 20 deletions(-)
+ create mode 100644 third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+ create mode 100644 third_party/WebKit/Source/wtf/text/TaintTracking.h
+
+diff --git a/extensions/renderer/static_v8_external_one_byte_string_resource.h b/extensions/renderer/static_v8_external_one_byte_string_resource.h
+index 3f569585a7b7..88f3c4102151 100644
+--- a/extensions/renderer/static_v8_external_one_byte_string_resource.h
++++ b/extensions/renderer/static_v8_external_one_byte_string_resource.h
+@@ -17,7 +17,8 @@ namespace extensions {
+ // wraps a buffer. The buffer must outlive the v8 runtime instance this resource
+ // is used in.
+ class StaticV8ExternalOneByteStringResource
+-    : public v8::String::ExternalOneByteStringResource {
++  : public v8::String::ExternalOneByteStringResource,
++    public v8::String::TaintTrackingStringBufferImpl {
+  public:
+   explicit StaticV8ExternalOneByteStringResource(
+       const base::StringPiece& buffer);
+diff --git a/net/proxy/proxy_resolver_v8.cc b/net/proxy/proxy_resolver_v8.cc
+index 16ad61f74240..d9d98e05db40 100644
+--- a/net/proxy/proxy_resolver_v8.cc
++++ b/net/proxy/proxy_resolver_v8.cc
+@@ -91,7 +91,8 @@ const char kPacUtilityResourceName[] = "proxy-pac-utility-script.js";
+ // External string wrapper so V8 can access the UTF16 string wrapped by
+ // ProxyResolverScriptData.
+ class V8ExternalStringFromScriptData
+-    : public v8::String::ExternalStringResource {
++  : public v8::String::ExternalStringResource,
++    public v8::String::TaintTrackingStringBufferImpl {
+  public:
+   explicit V8ExternalStringFromScriptData(
+       const scoped_refptr<ProxyResolverScriptData>& script_data)
+@@ -110,7 +111,8 @@ class V8ExternalStringFromScriptData
+ 
+ // External string wrapper so V8 can access a string literal.
+ class V8ExternalASCIILiteral
+-    : public v8::String::ExternalOneByteStringResource {
++    : public v8::String::ExternalOneByteStringResource,
++      public v8::String::TaintTrackingStringBufferImpl {
+  public:
+   // |ascii| must be a NULL-terminated C string, and must remain valid
+   // throughout this object's lifetime.
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
+index 86f55cf43657..b1e9578ba156 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
+@@ -9,6 +9,8 @@
+ #include "core/frame/LocalDOMWindow.h"
+ #include "core/frame/LocalFrame.h"
+ 
++#include "wtf/text/TaintTracking.h"
++
+ namespace blink {
+ 
+ PassRefPtr<ScriptState> ScriptState::create(v8::Local<v8::Context> context, PassRefPtr<DOMWrapperWorld> world)
+@@ -74,6 +76,28 @@ ScriptValue ScriptState::getFromExtrasExports(const char* name)
+     return ScriptValue(this, v8Value);
+ }
+ 
++int64_t ScriptState::LogIfTainted(const String& str,
++                                  v8::String::TaintSinkLabel label) {
++    StringImpl* impl = str.impl();
++    tainttracking::webkit::TaintData* buffer =
++        tainttracking::webkit::StringTaint::FromString(impl);
++    if (impl->is8Bit()) {
++        return v8::String::LogIfBufferTainted(
++                buffer,
++                impl->characters8(),
++                impl->length(),
++                isolate(),
++                label);
++    } else {
++        return v8::String::LogIfBufferTainted(
++                buffer,
++                impl->characters16(),
++                impl->length(),
++                isolate(),
++                label);
++    }
++}
++
+ ExecutionContext* ScriptState::getExecutionContext() const
+ {
+     v8::HandleScope scope(m_isolate);
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.h b/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
+index 0274349640b0..8a0791aac399 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
+@@ -121,6 +121,8 @@ public:
+     V8PerContextData* perContextData() const { return m_perContextData.get(); }
+     void disposePerContextData();
+ 
++    int64_t LogIfTainted(const String& str, v8::String::TaintSinkLabel label);
++
+     ScriptValue getFromExtrasExports(const char* name);
+ 
+ protected:
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+index f4a208552a1c..c201ad12454b 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+@@ -27,6 +27,19 @@
+ 
+ #include "bindings/core/v8/V8Binding.h"
+ 
++static_assert(sizeof(tainttracking::webkit::TaintData) ==
++              sizeof(v8::String::TaintData),
++              "Taint tracking data size must be equal");
++
++#define TAINT_ASSERT_EQUAL(n) static_assert( \
++    static_cast<uint8_t>(v8::String::TaintType::n) == \
++    static_cast<uint8_t>(tainttracking::webkit::TaintType::n), \
++    "Taint tracking enum must be equal. ")
++
++TAINT_TRACKING_TAINT_TYPE_FOR(TAINT_ASSERT_EQUAL);
++#undef TAINT_ASSERT_EQUAL
++
++
+ namespace blink {
+ 
+ template<class StringClass> struct StringTraits {
+@@ -55,6 +68,10 @@ struct StringTraits<AtomicString> {
+     static AtomicString fromV8String(v8::Local<v8::String>, int);
+ };
+ 
++void writeTaintHelper(v8::Local<v8::String> v8String, StringImpl* buffer, int length) {
++    v8String->WriteTaint(tainttracking::webkit::StringTaint::FromString(buffer), 0, length);
++}
++
+ struct V8StringTwoBytesTrait {
+     typedef UChar CharType;
+     ALWAYS_INLINE static void write(v8::Local<v8::String> v8String, CharType* buffer, int length)
+@@ -78,6 +95,7 @@ String StringTraits<String>::fromV8String(v8::Local<v8::String> v8String, int le
+     typename V8StringTrait::CharType* buffer;
+     String result = String::createUninitialized(length, buffer);
+     V8StringTrait::write(v8String, buffer, length);
++    writeTaintHelper(v8String, result.impl(), length);
+     return result;
+ }
+ 
+@@ -89,11 +107,14 @@ AtomicString StringTraits<AtomicString>::fromV8String(v8::Local<v8::String> v8St
+     if (length <= inlineBufferSize) {
+         typename V8StringTrait::CharType inlineBuffer[inlineBufferSize];
+         V8StringTrait::write(v8String, inlineBuffer, length);
+-        return AtomicString(inlineBuffer, length);
++        AtomicString answer (inlineBuffer, length);
++        writeTaintHelper(v8String, answer.impl(), length);
++        return answer;
+     }
+     typename V8StringTrait::CharType* buffer;
+     String string = String::createUninitialized(length, buffer);
+     V8StringTrait::write(v8String, buffer, length);
++    writeTaintHelper(v8String, string.impl(), length);
+     return AtomicString(string);
+ }
+ 
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h
+index f7419ab3f72e..782aee338e25 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h
+@@ -38,7 +38,7 @@ namespace blink {
+ 
+ // WebCoreStringResource is a helper class for v8ExternalString. It is used
+ // to manage the life-cycle of the underlying buffer of the external string.
+-class WebCoreStringResourceBase {
++class WebCoreStringResourceBase : public virtual v8::String::TaintTrackingBase {
+     USING_FAST_MALLOC(WebCoreStringResourceBase);
+     WTF_MAKE_NONCOPYABLE(WebCoreStringResourceBase);
+ public:
+@@ -118,6 +118,10 @@ public:
+         return m_atomicString;
+     }
+ 
++    virtual uint8_t* InitTaintChars(size_t length) {
++        return GetTaintChars();
++    }
++
+     const CompressibleString& getCompressibleString() { return m_compressibleString; }
+ 
+ protected:
+@@ -163,6 +167,10 @@ public:
+         ASSERT(!string.is8Bit());
+     }
+ 
++    virtual uint8_t* GetTaintChars() const override {
++        return tainttracking::webkit::StringTaint::FromString(m_plainString.impl());
++    }
++
+     size_t length() const override { return m_plainString.impl()->length(); }
+     const uint16_t* data() const override
+     {
+@@ -185,6 +193,10 @@ public:
+         ASSERT(string.is8Bit());
+     }
+ 
++    virtual uint8_t* GetTaintChars() const override {
++        return tainttracking::webkit::StringTaint::FromString(m_plainString.impl());
++    }
++
+     size_t length() const override { return m_plainString.impl()->length(); }
+     const char* data() const override
+     {
+@@ -203,6 +215,10 @@ public:
+ 
+     bool IsCompressible() const override { return true; }
+ 
++    virtual uint8_t* GetTaintChars() const override {
++        return tainttracking::webkit::StringTaint::FromString(m_compressibleString.toString().impl());
++    }
++
+     size_t length() const override
+     {
+         return m_compressibleString.length();
+@@ -225,6 +241,10 @@ public:
+ 
+     bool IsCompressible() const override { return true; }
+ 
++    virtual uint8_t* GetTaintChars() const override {
++        return tainttracking::webkit::StringTaint::FromString(m_compressibleString.toString().impl());
++    }
++
+     size_t length() const override
+     {
+         return m_compressibleString.length();
+diff --git a/third_party/WebKit/Source/core/dom/Element.cpp b/third_party/WebKit/Source/core/dom/Element.cpp
+index 407edc3fa76f..f647d5699e61 100644
+--- a/third_party/WebKit/Source/core/dom/Element.cpp
++++ b/third_party/WebKit/Source/core/dom/Element.cpp
+@@ -2570,16 +2570,32 @@ void Element::dispatchFocusOutEvent(const AtomicString& eventType, Element* newF
+     dispatchScopedEvent(FocusEvent::create(eventType, true, false, document().domWindow(), 0, newFocusedElement, sourceCapabilities));
+ }
+ 
++String Element::innerHTMLTaintAware(ScriptState* unused) const
++{
++    return innerHTML();
++}
++
+ String Element::innerHTML() const
+ {
+     return createMarkup(this, ChildrenOnly);
+ }
+ 
++String Element::outerHTMLTaintAware(ScriptState* unused) const
++{
++    return outerHTML();
++}
++
+ String Element::outerHTML() const
+ {
+     return createMarkup(this);
+ }
+ 
++void Element::setInnerHTMLTaintAware(ScriptState* fortaintcheck, const String& html, ExceptionState& exceptionState)
++{
++    fortaintcheck->LogIfTainted(html, v8::String::TaintSinkLabel::HTML);
++    setInnerHTML(html, exceptionState);
++}
++
+ void Element::setInnerHTML(const String& html, ExceptionState& exceptionState)
+ {
+     InspectorInstrumentation::NativeBreakpoint nativeBreakpoint(&document(), "setInnerHTML", true);
+@@ -2591,6 +2607,12 @@ void Element::setInnerHTML(const String& html, ExceptionState& exceptionState)
+     }
+ }
+ 
++void Element::setOuterHTMLTaintAware(ScriptState* fortaintcheck, const String& html, ExceptionState& exceptionState)
++{
++    fortaintcheck->LogIfTainted(html, v8::String::TaintSinkLabel::HTML);
++    setOuterHTML(html, exceptionState);
++}
++
+ void Element::setOuterHTML(const String& html, ExceptionState& exceptionState)
+ {
+     Node* p = parentNode();
+diff --git a/third_party/WebKit/Source/core/dom/Element.h b/third_party/WebKit/Source/core/dom/Element.h
+index 673c4e445446..64a4ec3b5678 100644
+--- a/third_party/WebKit/Source/core/dom/Element.h
++++ b/third_party/WebKit/Source/core/dom/Element.h
+@@ -442,6 +442,12 @@ public:
+     void setInnerHTML(const String&, ExceptionState&);
+     void setOuterHTML(const String&, ExceptionState&);
+ 
++    String innerHTMLTaintAware(ScriptState*) const;
++    String outerHTMLTaintAware(ScriptState*) const;
++    void setInnerHTMLTaintAware(ScriptState*, const String&, ExceptionState&);
++    void setOuterHTMLTaintAware(ScriptState*, const String&, ExceptionState&);
++
++
+     Element* insertAdjacentElement(const String& where, Element* newChild, ExceptionState&);
+     void insertAdjacentText(const String& where, const String& text, ExceptionState&);
+     void insertAdjacentHTML(const String& where, const String& html, ExceptionState&);
+diff --git a/third_party/WebKit/Source/core/dom/Element.idl b/third_party/WebKit/Source/core/dom/Element.idl
+index c8a7b622df09..0caf5ed347f1 100644
+--- a/third_party/WebKit/Source/core/dom/Element.idl
++++ b/third_party/WebKit/Source/core/dom/Element.idl
+@@ -69,8 +69,8 @@ interface Element : Node {
+ 
+     // DOM Parsing and Serialization
+     // https://dvcs.w3.org/hg/innerhtml/raw-file/tip/index.html#extensions-to-the-element-interface
+-    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter] attribute DOMString innerHTML;
+-    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter] attribute DOMString outerHTML;
++    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter, CallWith=ScriptState, ImplementedAs=innerHTMLTaintAware] attribute DOMString innerHTML;
++    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter, CallWith=ScriptState, ImplementedAs=innerHTMLTaintAware] attribute DOMString outerHTML;
+     [CEReactions, CustomElementCallbacks, RaisesException] void insertAdjacentHTML(DOMString position, DOMString text);
+ 
+     // Shadow DOM
+diff --git a/third_party/WebKit/Source/core/frame/Location.cpp b/third_party/WebKit/Source/core/frame/Location.cpp
+index b83f6ffdb0c2..957362a950ce 100644
+--- a/third_party/WebKit/Source/core/frame/Location.cpp
++++ b/third_party/WebKit/Source/core/frame/Location.cpp
+@@ -65,7 +65,10 @@ String Location::href() const
+     if (!m_frame)
+         return String();
+ 
+-    return url().strippedForUseAsHref();
++    String answer = url().strippedForUseAsHref();
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
+ }
+ 
+ String Location::protocol() const
+@@ -79,14 +82,21 @@ String Location::host() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::host(url());
++
++    String answer = DOMURLUtilsReadOnly::host(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
+ }
+ 
+ String Location::hostname() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::hostname(url());
++    String answer = DOMURLUtilsReadOnly::hostname(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
+ }
+ 
+ String Location::port() const
+@@ -100,21 +110,30 @@ String Location::pathname() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::pathname(url());
++    String answer = DOMURLUtilsReadOnly::pathname(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
+ }
+ 
+ String Location::search() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::search(url());
++    String answer = DOMURLUtilsReadOnly::search(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
+ }
+ 
+ String Location::origin() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::origin(url());
++    String answer = DOMURLUtilsReadOnly::origin(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
+ }
+ 
+ DOMStringList* Location::ancestorOrigins() const
+@@ -132,7 +151,11 @@ String Location::hash() const
+     if (!m_frame)
+         return String();
+ 
+-    return DOMURLUtilsReadOnly::hash(url());
++    String answer = DOMURLUtilsReadOnly::hash(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL);
++    return answer;
++
+ }
+ 
+ void Location::setHref(LocalDOMWindow* currentWindow, LocalDOMWindow* enteredWindow, const String& url)
+diff --git a/third_party/WebKit/Source/wtf/text/StringImpl.cpp b/third_party/WebKit/Source/wtf/text/StringImpl.cpp
+index afae4ebd082b..6b12bc53efa2 100644
+--- a/third_party/WebKit/Source/wtf/text/StringImpl.cpp
++++ b/third_party/WebKit/Source/wtf/text/StringImpl.cpp
+@@ -299,7 +299,9 @@ PassRefPtr<StringImpl> StringImpl::createUninitialized(unsigned length, LChar*&
+     StringImpl* string = static_cast<StringImpl*>(Partitions::bufferMalloc(allocationSize<LChar>(length), "WTF::StringImpl"));
+ 
+     data = reinterpret_cast<LChar*>(string + 1);
+-    return adoptRef(new (string) StringImpl(length, Force8BitConstructor));
++    StringImpl* answer = new (string) StringImpl(length, Force8BitConstructor);
++    tainttracking::webkit::StringTaint::InitTaintData(answer);
++    return adoptRef(answer);
+ }
+ 
+ PassRefPtr<StringImpl> StringImpl::createUninitialized(unsigned length, UChar*& data)
+@@ -315,7 +317,9 @@ PassRefPtr<StringImpl> StringImpl::createUninitialized(unsigned length, UChar*&
+     StringImpl* string = static_cast<StringImpl*>(Partitions::bufferMalloc(allocationSize<UChar>(length), "WTF::StringImpl"));
+ 
+     data = reinterpret_cast<UChar*>(string + 1);
+-    return adoptRef(new (string) StringImpl(length));
++    StringImpl* answer = new (string) StringImpl(length);
++    tainttracking::webkit::StringTaint::InitTaintData(answer);
++    return adoptRef(answer);
+ }
+ 
+ static StaticStringsTable& staticStrings()
+@@ -359,8 +363,9 @@ StringImpl* StringImpl::createStatic(const char* string, unsigned length, unsign
+     // Allocate a single buffer large enough to contain the StringImpl
+     // struct as well as the data which it contains. This removes one
+     // heap allocation from this call.
+-    RELEASE_ASSERT(length <= ((std::numeric_limits<unsigned>::max() - sizeof(StringImpl)) / sizeof(LChar)));
+-    size_t size = sizeof(StringImpl) + length * sizeof(LChar);
++    // RELEASE_ASSERT(length <= ((std::numeric_limits<unsigned>::max() - sizeof(StringImpl)) / sizeof(LChar)));
++    // size_t size = sizeof(StringImpl) + length * sizeof(LChar);
++    size_t size = allocationSize<LChar>(length);
+ 
+     WTF_INTERNAL_LEAK_SANITIZER_DISABLED_SCOPE;
+     StringImpl* impl = static_cast<StringImpl*>(Partitions::bufferMalloc(size, "WTF::StringImpl"));
+@@ -368,6 +373,8 @@ StringImpl* StringImpl::createStatic(const char* string, unsigned length, unsign
+     LChar* data = reinterpret_cast<LChar*>(impl + 1);
+     impl = new (impl) StringImpl(length, hash, StaticString);
+     memcpy(data, string, length * sizeof(LChar));
++    tainttracking::webkit::StringTaint::InitTaintData(impl);
++
+ #if ENABLE(ASSERT)
+     impl->assertHashIsCorrect();
+ #endif
+diff --git a/third_party/WebKit/Source/wtf/text/StringImpl.h b/third_party/WebKit/Source/wtf/text/StringImpl.h
+index 89bef3aca802..c1aa84e530f0 100644
+--- a/third_party/WebKit/Source/wtf/text/StringImpl.h
++++ b/third_party/WebKit/Source/wtf/text/StringImpl.h
+@@ -30,6 +30,9 @@
+ #include "wtf/Vector.h"
+ #include "wtf/WTFExport.h"
+ #include "wtf/text/Unicode.h"
++
++#include "wtf/text/TaintTracking.h"
++
+ #include <limits.h>
+ #include <string.h>
+ 
+@@ -416,8 +419,8 @@ public:
+ private:
+     template<typename CharType> static size_t allocationSize(unsigned length)
+     {
+-        RELEASE_ASSERT(length <= ((std::numeric_limits<unsigned>::max() - sizeof(StringImpl)) / sizeof(CharType)));
+-        return sizeof(StringImpl) + length * sizeof(CharType);
++        RELEASE_ASSERT(length <= ((std::numeric_limits<unsigned>::max() - sizeof(StringImpl)) / (sizeof(CharType) + 1)));
++        return sizeof(StringImpl) + length * sizeof(CharType) + tainttracking::webkit::StringTaint::AllocationSize(length);
+     }
+ 
+     template <class UCharPredicate> PassRefPtr<StringImpl> stripMatchedCharacters(UCharPredicate);
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.cpp b/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+new file mode 100644
+index 000000000000..c982d589e410
+--- /dev/null
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+@@ -0,0 +1,38 @@
++#include "TaintTracking.h"
++#include "StringImpl.h"
++
++#include <iostream>
++
++namespace tainttracking {
++namespace webkit {
++
++// static
++void StringTaint::InitTaintData(WTF::StringImpl* impl) {
++  memset(FromString(impl), 0, impl->length());
++}
++
++// static
++TaintData* StringTaint::FromString(WTF::StringImpl* impl) {
++  size_t len = impl->length();
++  if (impl->is8Bit()) {
++    return reinterpret_cast<TaintData*>(
++        &(reinterpret_cast<LChar*>(impl + 1)[len]));
++  } else {
++    return reinterpret_cast<TaintData*>(
++        &(reinterpret_cast<UChar*>(impl + 1)[len]));
++  }
++}
++
++// static
++size_t StringTaint::AllocationSize(unsigned length) {
++  return length * sizeof(TaintData);
++}
++
++// static
++void StringTaint::SetTainted(WTF::StringImpl* impl, TaintType type) {
++  memset(FromString(impl), static_cast<TaintData>(type), impl->length());
++}
++
++
++} // namespace tainttracking
++} // namespace webkit
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.h b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+new file mode 100644
+index 000000000000..04699ef8908e
+--- /dev/null
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+@@ -0,0 +1,59 @@
++#ifndef TAINT_WEBKIT_TRACKING_H
++#define TAINT_WEBKIT_TRACKING_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#include "wtf/WTFExport.h"
++
++namespace WTF {
++class StringImpl;
++};
++
++namespace tainttracking {
++namespace webkit {
++
++// Must match the same definition in v8/include/v8.h.
++enum TaintType {
++  UNTAINTED = 0,
++  TAINTED,
++  COOKIE,
++  MESSAGE,
++  URL,
++  DOM,
++  REFERRER,
++  WINDOWNAME,
++  STORAGE,
++  NETWORK,
++  MULTIPLE_TAINTS,
++  MAX_TAINT_TYPE,
++};
++
++#define TAINT_TRACKING_TAINT_TYPE_FOR(V) \
++  V(UNTAINTED);                          \
++  V(TAINTED);                            \
++  V(COOKIE);                             \
++  V(MESSAGE);                            \
++  V(URL);                                \
++  V(DOM);                                \
++  V(REFERRER);                           \
++  V(WINDOWNAME);                         \
++  V(STORAGE);                            \
++  V(NETWORK);                            \
++  V(MULTIPLE_TAINTS);                    \
++  V(MAX_TAINT_TYPE);
++
++typedef uint8_t TaintData;
++
++class WTF_EXPORT StringTaint {
++ public:
++  static TaintData* FromString(WTF::StringImpl* impl);
++  static void InitTaintData(WTF::StringImpl* impl);
++  static size_t AllocationSize(unsigned length);
++  static void SetTainted(WTF::StringImpl* impl, TaintType type);
++};
++
++} // namespace tainttracking
++} // namespace webkit
++
++#endif
+diff --git a/third_party/WebKit/Source/wtf/wtf.gypi b/third_party/WebKit/Source/wtf/wtf.gypi
+index c18f1a2ddfd2..bb0cdf45d9a9 100644
+--- a/third_party/WebKit/Source/wtf/wtf.gypi
++++ b/third_party/WebKit/Source/wtf/wtf.gypi
+@@ -162,6 +162,8 @@
+             'text/StringUTF8Adaptor.h',
+             'text/StringView.h',
+             'text/StringView.cpp',
++            'text/TaintTracking.h',
++            'text/TaintTracking.cpp',
+             'text/TextCodec.h',
+             'text/TextCodec.cpp',
+             'text/TextCodecASCIIFastPath.h',
+-- 
+2.14.1
+
+
+From 8e3a287fec67f066d075832655f2bf0170739eb6 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Mon, 19 Dec 2016 14:08:50 -0500
+Subject: [PATCH 02/11] New version of taint checking which does not require
+ idl changes
+
+---
+ third_party/WebKit/Source/core/dom/Document.cpp | 10 +++++++--
+ third_party/WebKit/Source/core/dom/Element.cpp  | 28 ++++++-------------------
+ third_party/WebKit/Source/core/dom/Element.h    |  6 ------
+ third_party/WebKit/Source/core/dom/Element.idl  |  4 ++--
+ third_party/WebKit/Source/core/dom/Node.cpp     | 11 ++++++++++
+ third_party/WebKit/Source/core/dom/Node.h       |  2 ++
+ 6 files changed, 29 insertions(+), 32 deletions(-)
+
+diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
+index 8c1c043632fe..670b631006fb 100644
+--- a/third_party/WebKit/Source/core/dom/Document.cpp
++++ b/third_party/WebKit/Source/core/dom/Document.cpp
+@@ -2847,11 +2847,13 @@ void Document::write(const SegmentedString& text, Document* enteredDocument, Exc
+ 
+ void Document::write(const String& text, Document* enteredDocument, ExceptionState& exceptionState)
+ {
++    LogIfTaintedNode(text, v8::String::TaintSinkLabel::HTML);
+     write(SegmentedString(text), enteredDocument, exceptionState);
+ }
+ 
+ void Document::writeln(const String& text, Document* enteredDocument, ExceptionState& exceptionState)
+ {
++    LogIfTaintedNode(text, v8::String::TaintSinkLabel::HTML);
+     write(text, enteredDocument, exceptionState);
+     if (exceptionState.hadException())
+         return;
+@@ -2862,8 +2864,10 @@ void Document::write(LocalDOMWindow* callingWindow, const Vector<String>& text,
+ {
+     DCHECK(callingWindow);
+     StringBuilder builder;
+-    for (const String& string : text)
++    for (const String& string : text) {
++        LogIfTaintedNode(string, v8::String::TaintSinkLabel::HTML);
+         builder.append(string);
++    }
+     write(builder.toString(), callingWindow->document(), exceptionState);
+ }
+ 
+@@ -2871,8 +2875,10 @@ void Document::writeln(LocalDOMWindow* callingWindow, const Vector<String>& text
+ {
+     DCHECK(callingWindow);
+     StringBuilder builder;
+-    for (const String& string : text)
++    for (const String& string : text) {
++        LogIfTaintedNode(string, v8::String::TaintSinkLabel::HTML);
+         builder.append(string);
++    }
+     writeln(builder.toString(), callingWindow->document(), exceptionState);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Element.cpp b/third_party/WebKit/Source/core/dom/Element.cpp
+index f647d5699e61..94ca2b073f5c 100644
+--- a/third_party/WebKit/Source/core/dom/Element.cpp
++++ b/third_party/WebKit/Source/core/dom/Element.cpp
+@@ -2570,34 +2570,20 @@ void Element::dispatchFocusOutEvent(const AtomicString& eventType, Element* newF
+     dispatchScopedEvent(FocusEvent::create(eventType, true, false, document().domWindow(), 0, newFocusedElement, sourceCapabilities));
+ }
+ 
+-String Element::innerHTMLTaintAware(ScriptState* unused) const
+-{
+-    return innerHTML();
+-}
+-
+ String Element::innerHTML() const
+ {
+     return createMarkup(this, ChildrenOnly);
+ }
+ 
+-String Element::outerHTMLTaintAware(ScriptState* unused) const
+-{
+-    return outerHTML();
+-}
+-
+ String Element::outerHTML() const
+ {
+     return createMarkup(this);
+ }
+ 
+-void Element::setInnerHTMLTaintAware(ScriptState* fortaintcheck, const String& html, ExceptionState& exceptionState)
+-{
+-    fortaintcheck->LogIfTainted(html, v8::String::TaintSinkLabel::HTML);
+-    setInnerHTML(html, exceptionState);
+-}
+-
+ void Element::setInnerHTML(const String& html, ExceptionState& exceptionState)
+ {
++    LogIfTaintedNode(html, v8::String::TaintSinkLabel::HTML);
++
+     InspectorInstrumentation::NativeBreakpoint nativeBreakpoint(&document(), "setInnerHTML", true);
+     if (DocumentFragment* fragment = createFragmentForInnerOuterHTML(html, this, AllowScriptingContent, "innerHTML", exceptionState)) {
+         ContainerNode* container = this;
+@@ -2607,12 +2593,6 @@ void Element::setInnerHTML(const String& html, ExceptionState& exceptionState)
+     }
+ }
+ 
+-void Element::setOuterHTMLTaintAware(ScriptState* fortaintcheck, const String& html, ExceptionState& exceptionState)
+-{
+-    fortaintcheck->LogIfTainted(html, v8::String::TaintSinkLabel::HTML);
+-    setOuterHTML(html, exceptionState);
+-}
+-
+ void Element::setOuterHTML(const String& html, ExceptionState& exceptionState)
+ {
+     Node* p = parentNode();
+@@ -2625,6 +2605,8 @@ void Element::setOuterHTML(const String& html, ExceptionState& exceptionState)
+         return;
+     }
+ 
++    LogIfTaintedNode(html, v8::String::TaintSinkLabel::HTML);
++
+     Element* parent = toElement(p);
+     Node* prev = previousSibling();
+     Node* next = nextSibling();
+@@ -2730,6 +2712,8 @@ void Element::insertAdjacentText(const String& where, const String& text, Except
+ 
+ void Element::insertAdjacentHTML(const String& where, const String& markup, ExceptionState& exceptionState)
+ {
++    LogIfTaintedNode(markup, v8::String::TaintSinkLabel::HTML);
++
+     Element* contextElement = contextElementForInsertion(where, this, exceptionState);
+     if (!contextElement)
+         return;
+diff --git a/third_party/WebKit/Source/core/dom/Element.h b/third_party/WebKit/Source/core/dom/Element.h
+index 64a4ec3b5678..673c4e445446 100644
+--- a/third_party/WebKit/Source/core/dom/Element.h
++++ b/third_party/WebKit/Source/core/dom/Element.h
+@@ -442,12 +442,6 @@ public:
+     void setInnerHTML(const String&, ExceptionState&);
+     void setOuterHTML(const String&, ExceptionState&);
+ 
+-    String innerHTMLTaintAware(ScriptState*) const;
+-    String outerHTMLTaintAware(ScriptState*) const;
+-    void setInnerHTMLTaintAware(ScriptState*, const String&, ExceptionState&);
+-    void setOuterHTMLTaintAware(ScriptState*, const String&, ExceptionState&);
+-
+-
+     Element* insertAdjacentElement(const String& where, Element* newChild, ExceptionState&);
+     void insertAdjacentText(const String& where, const String& text, ExceptionState&);
+     void insertAdjacentHTML(const String& where, const String& html, ExceptionState&);
+diff --git a/third_party/WebKit/Source/core/dom/Element.idl b/third_party/WebKit/Source/core/dom/Element.idl
+index 0caf5ed347f1..c8a7b622df09 100644
+--- a/third_party/WebKit/Source/core/dom/Element.idl
++++ b/third_party/WebKit/Source/core/dom/Element.idl
+@@ -69,8 +69,8 @@ interface Element : Node {
+ 
+     // DOM Parsing and Serialization
+     // https://dvcs.w3.org/hg/innerhtml/raw-file/tip/index.html#extensions-to-the-element-interface
+-    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter, CallWith=ScriptState, ImplementedAs=innerHTMLTaintAware] attribute DOMString innerHTML;
+-    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter, CallWith=ScriptState, ImplementedAs=innerHTMLTaintAware] attribute DOMString outerHTML;
++    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter] attribute DOMString innerHTML;
++    [TreatNullAs=NullString, CEReactions, CustomElementCallbacks, RaisesException=Setter] attribute DOMString outerHTML;
+     [CEReactions, CustomElementCallbacks, RaisesException] void insertAdjacentHTML(DOMString position, DOMString text);
+ 
+     // Shadow DOM
+diff --git a/third_party/WebKit/Source/core/dom/Node.cpp b/third_party/WebKit/Source/core/dom/Node.cpp
+index 49dbf9b8451b..7e9963183900 100644
+--- a/third_party/WebKit/Source/core/dom/Node.cpp
++++ b/third_party/WebKit/Source/core/dom/Node.cpp
+@@ -2374,6 +2374,17 @@ v8::Local<v8::Object> Node::associateWithWrapper(v8::Isolate* isolate, const Wra
+     return V8DOMWrapper::associateObjectWithWrapper(isolate, this, wrapperType, wrapper);
+ }
+ 
++void Node::LogIfTaintedNode(const String& value, v8::String::TaintSinkLabel label)
++{
++    LocalFrame* frame = document().frame();
++    if (frame) {
++        ScriptState* scriptState = ScriptState::forMainWorld(frame);
++        if (scriptState) {
++            scriptState->LogIfTainted(value, label);
++        }
++    }
++}
++
+ } // namespace blink
+ 
+ #ifndef NDEBUG
+diff --git a/third_party/WebKit/Source/core/dom/Node.h b/third_party/WebKit/Source/core/dom/Node.h
+index 2d03e74c8fea..9fbac4e4b86c 100644
+--- a/third_party/WebKit/Source/core/dom/Node.h
++++ b/third_party/WebKit/Source/core/dom/Node.h
+@@ -434,6 +434,8 @@ public:
+         return treeScope().document();
+     }
+ 
++    void LogIfTaintedNode(const String& value, v8::String::TaintSinkLabel label);
++
+     TreeScope& treeScope() const
+     {
+         DCHECK(m_treeScope);
+-- 
+2.14.1
+
+
+From f001ff5961ce34dce19c018657e597559a2115ff Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Wed, 21 Dec 2016 18:24:35 -0500
+Subject: [PATCH 03/11] Adding taint setting/checking for post message,
+ document referrer, script set src or text
+
+---
+ .../WebKit/Source/bindings/core/v8/V8StringResource.cpp        |  4 ++++
+ .../Source/bindings/core/v8/custom/V8MessageEventCustom.cpp    |  1 +
+ third_party/WebKit/Source/core/dom/Document.cpp                | 10 ++++++++--
+ third_party/WebKit/Source/core/dom/Node.cpp                    |  1 +
+ third_party/WebKit/Source/core/html/HTMLScriptElement.cpp      |  2 ++
+ 5 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+index c201ad12454b..03eea7cbd816 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+@@ -69,6 +69,10 @@ struct StringTraits<AtomicString> {
+ };
+ 
+ void writeTaintHelper(v8::Local<v8::String> v8String, StringImpl* buffer, int length) {
++    #ifdef DEBUG
++    ASSERT(v8String->Length() == length);
++    ASSERT(v8String->Length() == buffer->length());
++    #endif
+     v8String->WriteTaint(tainttracking::webkit::StringTaint::FromString(buffer), 0, length);
+ }
+ 
+diff --git a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+index 5254d1a0d832..bcf2f43aae58 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+@@ -86,6 +86,7 @@ void V8MessageEvent::dataAttributeGetterCustom(const v8::FunctionCallbackInfo<v8
+     // Store the result as a private value so this callback returns the cached
+     // result in future invocations.
+     privateCachedData.set(scriptState->context(), info.Holder(), result);
++    v8::String::SetTaint(result, info.GetIsolate(), v8::String::MESSAGE);
+     v8SetReturnValue(info, result);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
+index 670b631006fb..1500ed2056dd 100644
+--- a/third_party/WebKit/Source/core/dom/Document.cpp
++++ b/third_party/WebKit/Source/core/dom/Document.cpp
+@@ -4111,8 +4111,14 @@ void Document::setCookie(const String& value, ExceptionState& exceptionState)
+ 
+ const AtomicString& Document::referrer() const
+ {
+-    if (loader())
+-        return loader()->request().httpReferrer();
++    if (loader()) {
++        const AtomicString& answer = loader()->request().httpReferrer();
++        if (!answer.isNull()) {
++          tainttracking::webkit::StringTaint::SetTainted(
++              answer.impl(), tainttracking::webkit::TaintType::REFERRER);
++        }
++        return answer;
++    }
+     return nullAtom;
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Node.cpp b/third_party/WebKit/Source/core/dom/Node.cpp
+index 7e9963183900..65c4c6a8d89a 100644
+--- a/third_party/WebKit/Source/core/dom/Node.cpp
++++ b/third_party/WebKit/Source/core/dom/Node.cpp
+@@ -2374,6 +2374,7 @@ v8::Local<v8::Object> Node::associateWithWrapper(v8::Isolate* isolate, const Wra
+     return V8DOMWrapper::associateObjectWithWrapper(isolate, this, wrapperType, wrapper);
+ }
+ 
++
+ void Node::LogIfTaintedNode(const String& value, v8::String::TaintSinkLabel label)
+ {
+     LocalFrame* frame = document().frame();
+diff --git a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+index 94e7479c784a..3513ddb5d53a 100644
+--- a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+@@ -79,6 +79,7 @@ void HTMLScriptElement::didMoveToNewDocument(Document& oldDocument)
+ void HTMLScriptElement::parseAttribute(const QualifiedName& name, const AtomicString& oldValue, const AtomicString& value)
+ {
+     if (name == srcAttr) {
++        LogIfTaintedNode(value, v8::String::TaintSinkLabel::JAVASCRIPT_URL);
+         m_loader->handleSourceAttribute(value);
+         logUpdateAttributeIfIsolatedWorldAndInDocument("script", srcAttr, oldValue, value);
+     } else if (name == asyncAttr) {
+@@ -104,6 +105,7 @@ void HTMLScriptElement::didNotifySubtreeInsertionsToDocument()
+ 
+ void HTMLScriptElement::setText(const String &value)
+ {
++    LogIfTaintedNode(value, v8::String::TaintSinkLabel::JAVASCRIPT);
+     setTextContent(value);
+ }
+ 
+-- 
+2.14.1
+
+
+From 5128032360268c3440c5b7ec8d4ce6faf84db84d Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Thu, 22 Dec 2016 14:58:10 -0500
+Subject: [PATCH 04/11] Adding taint checking for urls in <a>, <embed>,
+ <iframe>, <img> Adding logging document url on load
+
+---
+ third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp |  4 ++++
+ third_party/WebKit/Source/core/dom/Document.cpp            |  6 +++++-
+ third_party/WebKit/Source/core/dom/Element.cpp             |  8 ++++++++
+ third_party/WebKit/Source/core/dom/Node.cpp                | 12 +++++++-----
+ third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp  |  2 ++
+ third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp   |  1 +
+ third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp  |  4 +++-
+ third_party/WebKit/Source/core/html/HTMLImageElement.cpp   |  1 +
+ 8 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+index a8d4be011e9c..e429e5af70f2 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+@@ -280,6 +280,10 @@ bool WindowProxy::initialize()
+                 originTrialContext->initializePendingFeatures();
+         }
+     }
++
++    // Log this for the taint tracking insturmentation
++    v8::TaintTracking::LogInitializeNavigate(v8String(m_isolate, m_frame->isLocalFrame() && toLocalFrame(m_frame)->document() ? toLocalFrame(m_frame)->document()->baseURI() : KURL()));
++
+     return true;
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
+index 1500ed2056dd..43487283951f 100644
+--- a/third_party/WebKit/Source/core/dom/Document.cpp
++++ b/third_party/WebKit/Source/core/dom/Document.cpp
+@@ -4075,7 +4075,10 @@ String Document::cookie(ExceptionState& exceptionState) const
+     if (cookieURL.isEmpty())
+         return String();
+ 
+-    return cookies(this, cookieURL);
++    String answer = cookies(this, cookieURL);
++    tainttracking::webkit::StringTaint::SetTainted(
++        answer.impl(), tainttracking::webkit::COOKIE);
++    return answer;
+ }
+ 
+ void Document::setCookie(const String& value, ExceptionState& exceptionState)
+@@ -4106,6 +4109,7 @@ void Document::setCookie(const String& value, ExceptionState& exceptionState)
+     if (cookieURL.isEmpty())
+         return;
+ 
++    LogIfTaintedNode(value, v8::String::COOKIE_SINK);
+     setCookies(this, cookieURL, value);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Element.cpp b/third_party/WebKit/Source/core/dom/Element.cpp
+index 94ca2b073f5c..786ff73c7623 100644
+--- a/third_party/WebKit/Source/core/dom/Element.cpp
++++ b/third_party/WebKit/Source/core/dom/Element.cpp
+@@ -1099,6 +1099,14 @@ void Element::setAttribute(const AtomicString& localName, const AtomicString& va
+     synchronizeAttribute(localName);
+     const AtomicString& caseAdjustedLocalName = shouldIgnoreAttributeCase() ? localName.lower() : localName;
+ 
++    // Check taint value
++    if (caseAdjustedLocalName.startsWith("on")) {
++        LogIfTaintedNode(value.getString(), v8::String::JAVASCRIPT);
++    }
++    if (styleAttr == caseAdjustedLocalName) {
++        LogIfTaintedNode(value.getString(), v8::String::CSS);
++    }
++
+     if (!elementData()) {
+         setAttributeInternal(kNotFound, QualifiedName(nullAtom, caseAdjustedLocalName, nullAtom), value, NotInSynchronizationOfLazyAttribute);
+         return;
+diff --git a/third_party/WebKit/Source/core/dom/Node.cpp b/third_party/WebKit/Source/core/dom/Node.cpp
+index 65c4c6a8d89a..3b26277480c8 100644
+--- a/third_party/WebKit/Source/core/dom/Node.cpp
++++ b/third_party/WebKit/Source/core/dom/Node.cpp
+@@ -2377,11 +2377,13 @@ v8::Local<v8::Object> Node::associateWithWrapper(v8::Isolate* isolate, const Wra
+ 
+ void Node::LogIfTaintedNode(const String& value, v8::String::TaintSinkLabel label)
+ {
+-    LocalFrame* frame = document().frame();
+-    if (frame) {
+-        ScriptState* scriptState = ScriptState::forMainWorld(frame);
+-        if (scriptState) {
+-            scriptState->LogIfTainted(value, label);
++    if (!value.isNull()) {
++        LocalFrame* frame = document().frame();
++        if (frame) {
++            ScriptState* scriptState = ScriptState::forMainWorld(frame);
++            if (scriptState) {
++                scriptState->LogIfTainted(value, label);
++            }
+         }
+     }
+ }
+diff --git a/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp b/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
+index f3d3de831bf0..37116b198b62 100644
+--- a/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
+@@ -262,6 +262,8 @@ void HTMLAnchorElement::setActive(bool down)
+ void HTMLAnchorElement::parseAttribute(const QualifiedName& name, const AtomicString& oldValue, const AtomicString& value)
+ {
+     if (name == hrefAttr) {
++        LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
++
+         bool wasLink = isLink();
+         setIsLink(!value.isNull());
+         if (wasLink || isLink()) {
+diff --git a/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp b/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
+index dfb698dacd38..e143f3aab6c5 100644
+--- a/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
+@@ -101,6 +101,7 @@ void HTMLEmbedElement::parseAttribute(const QualifiedName& name, const AtomicStr
+     } else if (name == codeAttr) { // TODO(schenney): Remove this? It's not in the spec and we're not in the HTMLAppletElement hierarchy
+         m_url = stripLeadingAndTrailingHTMLSpaces(value);
+     } else if (name == srcAttr) {
++        LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
+         m_url = stripLeadingAndTrailingHTMLSpaces(value);
+         if (layoutObject() && isImageType()) {
+             if (!m_imageLoader)
+diff --git a/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp b/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
+index 86f95d451593..276041be5f8b 100644
+--- a/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
+@@ -120,8 +120,10 @@ void HTMLIFrameElement::parseAttribute(const QualifiedName& name, const AtomicSt
+         if (initializePermissionsAttribute())
+             m_permissions->setValue(value);
+     } else {
+-        if (name == srcAttr)
++        if (name == srcAttr) {
++            LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
+             logUpdateAttributeIfIsolatedWorldAndInDocument("iframe", srcAttr, oldValue, value);
++        }
+         HTMLFrameElementBase::parseAttribute(name, oldValue, value);
+     }
+ }
+diff --git a/third_party/WebKit/Source/core/html/HTMLImageElement.cpp b/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
+index 25baa498a4e7..bec387ab1e94 100644
+--- a/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
+@@ -260,6 +260,7 @@ void HTMLImageElement::parseAttribute(const QualifiedName& name, const AtomicStr
+                 text->setTextContent(altText());
+         }
+     } else if (name == srcAttr || name == srcsetAttr || name == sizesAttr) {
++        LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
+         selectSourceURL(ImageLoader::UpdateIgnorePreviousError);
+     } else if (name == usemapAttr) {
+         setIsLink(!value.isNull());
+-- 
+2.14.1
+
+
+From 59d05d0f12b77e056b41dd859293cf8257892dc0 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Sun, 5 Mar 2017 16:51:20 -0500
+Subject: [PATCH 05/11] Committing old changes to webkit adding taints
+
+---
+ .../WebKit/Source/bindings/core/v8/ScriptState.cpp | 11 ++++++
+ .../WebKit/Source/bindings/core/v8/ScriptState.h   |  4 ++-
+ third_party/WebKit/Source/core/dom/Document.cpp    | 10 +++---
+ third_party/WebKit/Source/core/dom/Element.cpp     | 10 +++---
+ third_party/WebKit/Source/core/dom/Node.cpp        |  6 ++--
+ third_party/WebKit/Source/core/dom/Node.h          |  2 +-
+ third_party/WebKit/Source/core/frame/Location.cpp  | 25 +++++++++-----
+ .../WebKit/Source/core/html/HTMLAnchorElement.cpp  |  2 +-
+ .../WebKit/Source/core/html/HTMLEmbedElement.cpp   |  2 +-
+ .../WebKit/Source/core/html/HTMLIFrameElement.cpp  |  2 +-
+ .../WebKit/Source/core/html/HTMLImageElement.cpp   |  2 +-
+ .../WebKit/Source/core/html/HTMLScriptElement.cpp  |  4 +--
+ third_party/WebKit/Source/wtf/text/TaintTracking.h | 40 +++++++++++++++-------
+ 13 files changed, 79 insertions(+), 41 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
+index b1e9578ba156..ae2f2d39447b 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "wtf/text/TaintTracking.h"
+ 
++
+ namespace blink {
+ 
+ PassRefPtr<ScriptState> ScriptState::create(v8::Local<v8::Context> context, PassRefPtr<DOMWrapperWorld> world)
+@@ -77,7 +78,14 @@ ScriptValue ScriptState::getFromExtrasExports(const char* name)
+ }
+ 
+ int64_t ScriptState::LogIfTainted(const String& str,
++                                  // Must correspond to the JS argument index in
++                                  // the function callback info
++                                  int argument_index,
+                                   v8::String::TaintSinkLabel label) {
++    if (!hasCurrentScriptState(isolate())) {
++        return -1;
++    }
++
+     StringImpl* impl = str.impl();
+     tainttracking::webkit::TaintData* buffer =
+         tainttracking::webkit::StringTaint::FromString(impl);
+@@ -86,6 +94,7 @@ int64_t ScriptState::LogIfTainted(const String& str,
+                 buffer,
+                 impl->characters8(),
+                 impl->length(),
++                argument_index,
+                 isolate(),
+                 label);
+     } else {
+@@ -93,11 +102,13 @@ int64_t ScriptState::LogIfTainted(const String& str,
+                 buffer,
+                 impl->characters16(),
+                 impl->length(),
++                argument_index,
+                 isolate(),
+                 label);
+     }
+ }
+ 
++
+ ExecutionContext* ScriptState::getExecutionContext() const
+ {
+     v8::HandleScope scope(m_isolate);
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.h b/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
+index 8a0791aac399..d9aa36c1d3ec 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
+@@ -121,7 +121,9 @@ public:
+     V8PerContextData* perContextData() const { return m_perContextData.get(); }
+     void disposePerContextData();
+ 
+-    int64_t LogIfTainted(const String& str, v8::String::TaintSinkLabel label);
++    // arg_idx: must correspond to the JS argument index in the function
++    // callback info where String str was from.
++    int64_t LogIfTainted(const String& str, int arg_idx, v8::String::TaintSinkLabel label);
+ 
+     ScriptValue getFromExtrasExports(const char* name);
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
+index 43487283951f..4d1b081d7eb3 100644
+--- a/third_party/WebKit/Source/core/dom/Document.cpp
++++ b/third_party/WebKit/Source/core/dom/Document.cpp
+@@ -2847,13 +2847,13 @@ void Document::write(const SegmentedString& text, Document* enteredDocument, Exc
+ 
+ void Document::write(const String& text, Document* enteredDocument, ExceptionState& exceptionState)
+ {
+-    LogIfTaintedNode(text, v8::String::TaintSinkLabel::HTML);
++    LogIfTaintedNode(text, 0, v8::String::TaintSinkLabel::HTML);
+     write(SegmentedString(text), enteredDocument, exceptionState);
+ }
+ 
+ void Document::writeln(const String& text, Document* enteredDocument, ExceptionState& exceptionState)
+ {
+-    LogIfTaintedNode(text, v8::String::TaintSinkLabel::HTML);
++    LogIfTaintedNode(text, 0, v8::String::TaintSinkLabel::HTML);
+     write(text, enteredDocument, exceptionState);
+     if (exceptionState.hadException())
+         return;
+@@ -2865,7 +2865,7 @@ void Document::write(LocalDOMWindow* callingWindow, const Vector<String>& text,
+     DCHECK(callingWindow);
+     StringBuilder builder;
+     for (const String& string : text) {
+-        LogIfTaintedNode(string, v8::String::TaintSinkLabel::HTML);
++        LogIfTaintedNode(string, 0, v8::String::TaintSinkLabel::HTML);
+         builder.append(string);
+     }
+     write(builder.toString(), callingWindow->document(), exceptionState);
+@@ -2876,7 +2876,7 @@ void Document::writeln(LocalDOMWindow* callingWindow, const Vector<String>& text
+     DCHECK(callingWindow);
+     StringBuilder builder;
+     for (const String& string : text) {
+-        LogIfTaintedNode(string, v8::String::TaintSinkLabel::HTML);
++        LogIfTaintedNode(string, 0, v8::String::TaintSinkLabel::HTML);
+         builder.append(string);
+     }
+     writeln(builder.toString(), callingWindow->document(), exceptionState);
+@@ -4109,7 +4109,7 @@ void Document::setCookie(const String& value, ExceptionState& exceptionState)
+     if (cookieURL.isEmpty())
+         return;
+ 
+-    LogIfTaintedNode(value, v8::String::COOKIE_SINK);
++    LogIfTaintedNode(value, 0, v8::String::COOKIE_SINK);
+     setCookies(this, cookieURL, value);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Element.cpp b/third_party/WebKit/Source/core/dom/Element.cpp
+index 786ff73c7623..1de97a759ef6 100644
+--- a/third_party/WebKit/Source/core/dom/Element.cpp
++++ b/third_party/WebKit/Source/core/dom/Element.cpp
+@@ -1101,10 +1101,10 @@ void Element::setAttribute(const AtomicString& localName, const AtomicString& va
+ 
+     // Check taint value
+     if (caseAdjustedLocalName.startsWith("on")) {
+-        LogIfTaintedNode(value.getString(), v8::String::JAVASCRIPT);
++        LogIfTaintedNode(value.getString(), 1, v8::String::JAVASCRIPT);
+     }
+     if (styleAttr == caseAdjustedLocalName) {
+-        LogIfTaintedNode(value.getString(), v8::String::CSS);
++        LogIfTaintedNode(value.getString(), 1, v8::String::CSS);
+     }
+ 
+     if (!elementData()) {
+@@ -2590,7 +2590,7 @@ String Element::outerHTML() const
+ 
+ void Element::setInnerHTML(const String& html, ExceptionState& exceptionState)
+ {
+-    LogIfTaintedNode(html, v8::String::TaintSinkLabel::HTML);
++    LogIfTaintedNode(html, 0, v8::String::TaintSinkLabel::HTML);
+ 
+     InspectorInstrumentation::NativeBreakpoint nativeBreakpoint(&document(), "setInnerHTML", true);
+     if (DocumentFragment* fragment = createFragmentForInnerOuterHTML(html, this, AllowScriptingContent, "innerHTML", exceptionState)) {
+@@ -2613,7 +2613,7 @@ void Element::setOuterHTML(const String& html, ExceptionState& exceptionState)
+         return;
+     }
+ 
+-    LogIfTaintedNode(html, v8::String::TaintSinkLabel::HTML);
++    LogIfTaintedNode(html, 0, v8::String::TaintSinkLabel::HTML);
+ 
+     Element* parent = toElement(p);
+     Node* prev = previousSibling();
+@@ -2720,7 +2720,7 @@ void Element::insertAdjacentText(const String& where, const String& text, Except
+ 
+ void Element::insertAdjacentHTML(const String& where, const String& markup, ExceptionState& exceptionState)
+ {
+-    LogIfTaintedNode(markup, v8::String::TaintSinkLabel::HTML);
++    LogIfTaintedNode(markup, 1, v8::String::TaintSinkLabel::HTML);
+ 
+     Element* contextElement = contextElementForInsertion(where, this, exceptionState);
+     if (!contextElement)
+diff --git a/third_party/WebKit/Source/core/dom/Node.cpp b/third_party/WebKit/Source/core/dom/Node.cpp
+index 3b26277480c8..8c2a91225f4e 100644
+--- a/third_party/WebKit/Source/core/dom/Node.cpp
++++ b/third_party/WebKit/Source/core/dom/Node.cpp
+@@ -2375,14 +2375,16 @@ v8::Local<v8::Object> Node::associateWithWrapper(v8::Isolate* isolate, const Wra
+ }
+ 
+ 
+-void Node::LogIfTaintedNode(const String& value, v8::String::TaintSinkLabel label)
++void Node::LogIfTaintedNode(const String& value,
++                            int symbolic_arg,
++                            v8::String::TaintSinkLabel label)
+ {
+     if (!value.isNull()) {
+         LocalFrame* frame = document().frame();
+         if (frame) {
+             ScriptState* scriptState = ScriptState::forMainWorld(frame);
+             if (scriptState) {
+-                scriptState->LogIfTainted(value, label);
++                scriptState->LogIfTainted(value, symbolic_arg, label);
+             }
+         }
+     }
+diff --git a/third_party/WebKit/Source/core/dom/Node.h b/third_party/WebKit/Source/core/dom/Node.h
+index 9fbac4e4b86c..131418c74393 100644
+--- a/third_party/WebKit/Source/core/dom/Node.h
++++ b/third_party/WebKit/Source/core/dom/Node.h
+@@ -434,7 +434,7 @@ public:
+         return treeScope().document();
+     }
+ 
+-    void LogIfTaintedNode(const String& value, v8::String::TaintSinkLabel label);
++    void LogIfTaintedNode(const String& value, int symbolic_arg, v8::String::TaintSinkLabel label);
+ 
+     TreeScope& treeScope() const
+     {
+diff --git a/third_party/WebKit/Source/core/frame/Location.cpp b/third_party/WebKit/Source/core/frame/Location.cpp
+index 957362a950ce..41482cfe28fa 100644
+--- a/third_party/WebKit/Source/core/frame/Location.cpp
++++ b/third_party/WebKit/Source/core/frame/Location.cpp
+@@ -75,7 +75,11 @@ String Location::protocol() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::protocol(url());
++
++    String answer = DOMURLUtilsReadOnly::protocol(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL_PROTOCOL);
++    return answer;
+ }
+ 
+ String Location::host() const
+@@ -85,7 +89,7 @@ String Location::host() const
+ 
+     String answer = DOMURLUtilsReadOnly::host(url());
+     tainttracking::webkit::StringTaint::SetTainted(
+-            answer.impl(), tainttracking::webkit::TaintType::URL);
++            answer.impl(), tainttracking::webkit::TaintType::URL_HOST);
+     return answer;
+ }
+ 
+@@ -95,7 +99,7 @@ String Location::hostname() const
+         return String();
+     String answer = DOMURLUtilsReadOnly::hostname(url());
+     tainttracking::webkit::StringTaint::SetTainted(
+-            answer.impl(), tainttracking::webkit::TaintType::URL);
++            answer.impl(), tainttracking::webkit::TaintType::URL_HOSTNAME);
+     return answer;
+ }
+ 
+@@ -103,7 +107,11 @@ String Location::port() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::port(url());
++
++    String answer = DOMURLUtilsReadOnly::port(url());
++    tainttracking::webkit::StringTaint::SetTainted(
++            answer.impl(), tainttracking::webkit::TaintType::URL_PORT);
++    return answer;
+ }
+ 
+ String Location::pathname() const
+@@ -112,7 +120,7 @@ String Location::pathname() const
+         return String();
+     String answer = DOMURLUtilsReadOnly::pathname(url());
+     tainttracking::webkit::StringTaint::SetTainted(
+-            answer.impl(), tainttracking::webkit::TaintType::URL);
++            answer.impl(), tainttracking::webkit::TaintType::URL_PATHNAME);
+     return answer;
+ }
+ 
+@@ -122,7 +130,7 @@ String Location::search() const
+         return String();
+     String answer = DOMURLUtilsReadOnly::search(url());
+     tainttracking::webkit::StringTaint::SetTainted(
+-            answer.impl(), tainttracking::webkit::TaintType::URL);
++            answer.impl(), tainttracking::webkit::TaintType::URL_SEARCH);
+     return answer;
+ }
+ 
+@@ -132,7 +140,7 @@ String Location::origin() const
+         return String();
+     String answer = DOMURLUtilsReadOnly::origin(url());
+     tainttracking::webkit::StringTaint::SetTainted(
+-            answer.impl(), tainttracking::webkit::TaintType::URL);
++            answer.impl(), tainttracking::webkit::TaintType::URL_ORIGIN);
+     return answer;
+ }
+ 
+@@ -153,9 +161,8 @@ String Location::hash() const
+ 
+     String answer = DOMURLUtilsReadOnly::hash(url());
+     tainttracking::webkit::StringTaint::SetTainted(
+-            answer.impl(), tainttracking::webkit::TaintType::URL);
++            answer.impl(), tainttracking::webkit::TaintType::URL_HASH);
+     return answer;
+-
+ }
+ 
+ void Location::setHref(LocalDOMWindow* currentWindow, LocalDOMWindow* enteredWindow, const String& url)
+diff --git a/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp b/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
+index 37116b198b62..4856f64d951a 100644
+--- a/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
+@@ -262,7 +262,7 @@ void HTMLAnchorElement::setActive(bool down)
+ void HTMLAnchorElement::parseAttribute(const QualifiedName& name, const AtomicString& oldValue, const AtomicString& value)
+ {
+     if (name == hrefAttr) {
+-        LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
++        LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
+ 
+         bool wasLink = isLink();
+         setIsLink(!value.isNull());
+diff --git a/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp b/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
+index e143f3aab6c5..b1f76d64b6c5 100644
+--- a/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
+@@ -101,7 +101,7 @@ void HTMLEmbedElement::parseAttribute(const QualifiedName& name, const AtomicStr
+     } else if (name == codeAttr) { // TODO(schenney): Remove this? It's not in the spec and we're not in the HTMLAppletElement hierarchy
+         m_url = stripLeadingAndTrailingHTMLSpaces(value);
+     } else if (name == srcAttr) {
+-        LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
++        LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
+         m_url = stripLeadingAndTrailingHTMLSpaces(value);
+         if (layoutObject() && isImageType()) {
+             if (!m_imageLoader)
+diff --git a/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp b/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
+index 276041be5f8b..ad0521d9152a 100644
+--- a/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
+@@ -121,7 +121,7 @@ void HTMLIFrameElement::parseAttribute(const QualifiedName& name, const AtomicSt
+             m_permissions->setValue(value);
+     } else {
+         if (name == srcAttr) {
+-            LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
++            LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
+             logUpdateAttributeIfIsolatedWorldAndInDocument("iframe", srcAttr, oldValue, value);
+         }
+         HTMLFrameElementBase::parseAttribute(name, oldValue, value);
+diff --git a/third_party/WebKit/Source/core/html/HTMLImageElement.cpp b/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
+index bec387ab1e94..53c8d25d9588 100644
+--- a/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
+@@ -260,7 +260,7 @@ void HTMLImageElement::parseAttribute(const QualifiedName& name, const AtomicStr
+                 text->setTextContent(altText());
+         }
+     } else if (name == srcAttr || name == srcsetAttr || name == sizesAttr) {
+-        LogIfTaintedNode(value.getString(), v8::String::URL_SINK);
++        LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
+         selectSourceURL(ImageLoader::UpdateIgnorePreviousError);
+     } else if (name == usemapAttr) {
+         setIsLink(!value.isNull());
+diff --git a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+index 3513ddb5d53a..3554daa42129 100644
+--- a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+@@ -79,7 +79,7 @@ void HTMLScriptElement::didMoveToNewDocument(Document& oldDocument)
+ void HTMLScriptElement::parseAttribute(const QualifiedName& name, const AtomicString& oldValue, const AtomicString& value)
+ {
+     if (name == srcAttr) {
+-        LogIfTaintedNode(value, v8::String::TaintSinkLabel::JAVASCRIPT_URL);
++        LogIfTaintedNode(value, 1, v8::String::TaintSinkLabel::JAVASCRIPT_URL);
+         m_loader->handleSourceAttribute(value);
+         logUpdateAttributeIfIsolatedWorldAndInDocument("script", srcAttr, oldValue, value);
+     } else if (name == asyncAttr) {
+@@ -105,7 +105,7 @@ void HTMLScriptElement::didNotifySubtreeInsertionsToDocument()
+ 
+ void HTMLScriptElement::setText(const String &value)
+ {
+-    LogIfTaintedNode(value, v8::String::TaintSinkLabel::JAVASCRIPT);
++    LogIfTaintedNode(value, 1, v8::String::TaintSinkLabel::JAVASCRIPT);
+     setTextContent(value);
+ }
+ 
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.h b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+index 04699ef8908e..d654f77fbfdb 100644
+--- a/third_party/WebKit/Source/wtf/text/TaintTracking.h
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+@@ -20,6 +20,14 @@ enum TaintType {
+   COOKIE,
+   MESSAGE,
+   URL,
++  URL_HASH,
++  URL_PROTOCOL,
++  URL_HOST,
++  URL_HOSTNAME,
++  URL_ORIGIN,
++  URL_PORT,
++  URL_PATHNAME,
++  URL_SEARCH,
+   DOM,
+   REFERRER,
+   WINDOWNAME,
+@@ -29,18 +37,26 @@ enum TaintType {
+   MAX_TAINT_TYPE,
+ };
+ 
+-#define TAINT_TRACKING_TAINT_TYPE_FOR(V) \
+-  V(UNTAINTED);                          \
+-  V(TAINTED);                            \
+-  V(COOKIE);                             \
+-  V(MESSAGE);                            \
+-  V(URL);                                \
+-  V(DOM);                                \
+-  V(REFERRER);                           \
+-  V(WINDOWNAME);                         \
+-  V(STORAGE);                            \
+-  V(NETWORK);                            \
+-  V(MULTIPLE_TAINTS);                    \
++#define TAINT_TRACKING_TAINT_TYPE_FOR(V)        \
++  V(UNTAINTED);                                 \
++  V(TAINTED);                                   \
++  V(COOKIE);                                    \
++  V(MESSAGE);                                   \
++  V(URL);                                       \
++  V(URL_HASH);                                  \
++  V(URL_PROTOCOL);                              \
++  V(URL_HOST);                                  \
++  V(URL_HOSTNAME);                              \
++  V(URL_ORIGIN);                                \
++  V(URL_PORT);                                  \
++  V(URL_PATHNAME);                              \
++  V(URL_SEARCH);                                \
++  V(DOM);                                       \
++  V(REFERRER);                                  \
++  V(WINDOWNAME);                                \
++  V(STORAGE);                                   \
++  V(NETWORK);                                   \
++  V(MULTIPLE_TAINTS);                           \
+   V(MAX_TAINT_TYPE);
+ 
+ typedef uint8_t TaintData;
+-- 
+2.14.1
+
+
+From 379fa1928d459ef8635523af2ef943c872620d74 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Thu, 23 Mar 2017 14:55:14 -0400
+Subject: [PATCH 06/11] Adding changes to track different types of url sinks
+
+---
+ .../WebKit/Source/bindings/core/v8/ScriptState.cpp | 10 +++
+ .../WebKit/Source/bindings/core/v8/ScriptState.h   |  2 +
+ .../Source/bindings/core/v8/V8StringResource.cpp   |  3 +-
+ third_party/WebKit/Source/core/dom/Element.cpp     |  3 +-
+ .../WebKit/Source/core/frame/DOMWindowTimers.cpp   | 26 ++++++
+ .../WebKit/Source/core/html/HTMLAnchorElement.cpp  |  2 +-
+ .../WebKit/Source/core/html/HTMLEmbedElement.cpp   |  2 +-
+ .../WebKit/Source/core/html/HTMLIFrameElement.cpp  |  2 +-
+ .../WebKit/Source/core/html/HTMLImageElement.cpp   |  2 +-
+ .../WebKit/Source/core/html/HTMLScriptElement.cpp  |  2 +-
+ third_party/WebKit/Source/wtf/text/TaintTracking.h | 97 +++++++++++++---------
+ ui/events/x/events_x_utils.cc                      |  2 +-
+ 12 files changed, 104 insertions(+), 49 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
+index ae2f2d39447b..1dc8a084ecaf 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
+@@ -77,6 +77,16 @@ ScriptValue ScriptState::getFromExtrasExports(const char* name)
+     return ScriptValue(this, v8Value);
+ }
+ 
++int64_t ScriptState::LogIfTainted(const v8::Local<v8::String>& str,
++                                  int arg_idx,
++                                  v8::String::TaintSinkLabel label) {
++    if (!hasCurrentScriptState(isolate())) {
++        return -1;
++    }
++
++    return str->LogIfTainted(label, arg_idx);
++}
++
+ int64_t ScriptState::LogIfTainted(const String& str,
+                                   // Must correspond to the JS argument index in
+                                   // the function callback info
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.h b/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
+index d9aa36c1d3ec..aaabe4083562 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptState.h
+@@ -124,6 +124,8 @@ public:
+     // arg_idx: must correspond to the JS argument index in the function
+     // callback info where String str was from.
+     int64_t LogIfTainted(const String& str, int arg_idx, v8::String::TaintSinkLabel label);
++    int64_t LogIfTainted(const v8::Local<v8::String>& str, int arg_idx, v8::String::TaintSinkLabel label);
++
+ 
+     ScriptValue getFromExtrasExports(const char* name);
+ 
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+index 03eea7cbd816..ac091929101c 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+@@ -31,10 +31,11 @@ static_assert(sizeof(tainttracking::webkit::TaintData) ==
+               sizeof(v8::String::TaintData),
+               "Taint tracking data size must be equal");
+ 
++// Guard that the two taint information implementations are the same.
+ #define TAINT_ASSERT_EQUAL(n) static_assert( \
+     static_cast<uint8_t>(v8::String::TaintType::n) == \
+     static_cast<uint8_t>(tainttracking::webkit::TaintType::n), \
+-    "Taint tracking enum must be equal. ")
++    "Taint tracking enum must be equal. ");
+ 
+ TAINT_TRACKING_TAINT_TYPE_FOR(TAINT_ASSERT_EQUAL);
+ #undef TAINT_ASSERT_EQUAL
+diff --git a/third_party/WebKit/Source/core/dom/Element.cpp b/third_party/WebKit/Source/core/dom/Element.cpp
+index 1de97a759ef6..5dfeaf884ee6 100644
+--- a/third_party/WebKit/Source/core/dom/Element.cpp
++++ b/third_party/WebKit/Source/core/dom/Element.cpp
+@@ -1101,7 +1101,7 @@ void Element::setAttribute(const AtomicString& localName, const AtomicString& va
+ 
+     // Check taint value
+     if (caseAdjustedLocalName.startsWith("on")) {
+-        LogIfTaintedNode(value.getString(), 1, v8::String::JAVASCRIPT);
++        LogIfTaintedNode(value.getString(), 1, v8::String::JAVASCRIPT_EVENT_HANDLER_ATTRIBUTE);
+     }
+     if (styleAttr == caseAdjustedLocalName) {
+         LogIfTaintedNode(value.getString(), 1, v8::String::CSS);
+@@ -1191,6 +1191,7 @@ void Element::attributeChanged(const QualifiedName& name, const AtomicString& ol
+         setHasName(!newValue.isNull());
+     } else if (isStyledElement()) {
+         if (name == styleAttr) {
++            LogIfTaintedNode(newValue, 1, v8::String::TaintSinkLabel::CSS_STYLE_ATTRIBUTE);
+             styleAttributeChanged(newValue, reason);
+         } else if (isPresentationAttribute(name)) {
+             elementData()->m_presentationAttributeStyleIsDirty = true;
+diff --git a/third_party/WebKit/Source/core/frame/DOMWindowTimers.cpp b/third_party/WebKit/Source/core/frame/DOMWindowTimers.cpp
+index 7efe08c2567c..e12af3e28781 100644
+--- a/third_party/WebKit/Source/core/frame/DOMWindowTimers.cpp
++++ b/third_party/WebKit/Source/core/frame/DOMWindowTimers.cpp
+@@ -75,6 +75,16 @@ int setTimeout(ScriptState* scriptState, EventTarget& eventTarget, const ScriptV
+         // be done using the scheduler instead.
+         V8GCForContextDispose::instance().notifyIdle();
+     }
++
++    if (!handler.isEmpty()) {
++        v8::Local<v8::Value> value = handler.v8ValueFor(scriptState);
++        if (value->IsString()) {
++            scriptState->LogIfTainted(
++                    v8::Local<v8::String>::Cast(value),
++                    0,
++                    v8::String::TaintSinkLabel::JAVASCRIPT_SET_TIMEOUT);
++        }
++    }
+     ScheduledAction* action = ScheduledAction::create(scriptState, handler, arguments);
+     return DOMTimer::install(executionContext, action, timeout, true);
+ }
+@@ -93,6 +103,9 @@ int setTimeout(ScriptState* scriptState, EventTarget& eventTarget, const String&
+         // be done using the scheduler instead.
+         V8GCForContextDispose::instance().notifyIdle();
+     }
++
++    scriptState->LogIfTainted(
++            handler, 0, v8::String::TaintSinkLabel::JAVASCRIPT_SET_TIMEOUT);
+     ScheduledAction* action = ScheduledAction::create(scriptState, handler);
+     return DOMTimer::install(executionContext, action, timeout, true);
+ }
+@@ -102,6 +115,16 @@ int setInterval(ScriptState* scriptState, EventTarget& eventTarget, const Script
+     ExecutionContext* executionContext = eventTarget.getExecutionContext();
+     if (!isAllowed(scriptState, executionContext, false))
+         return 0;
++
++    if (!handler.isEmpty()) {
++        v8::Local<v8::Value> value = handler.v8ValueFor(scriptState);
++        if (value->IsString()) {
++            scriptState->LogIfTainted(
++                    v8::Local<v8::String>::Cast(value),
++                    0,
++                    v8::String::TaintSinkLabel::JAVASCRIPT_SET_INTERVAL);
++        }
++    }
+     ScheduledAction* action = ScheduledAction::create(scriptState, handler, arguments);
+     return DOMTimer::install(executionContext, action, timeout, false);
+ }
+@@ -115,6 +138,9 @@ int setInterval(ScriptState* scriptState, EventTarget& eventTarget, const String
+     // perfomance issue.
+     if (handler.isEmpty())
+         return 0;
++
++    scriptState->LogIfTainted(
++            handler, 0, v8::String::TaintSinkLabel::JAVASCRIPT_SET_INTERVAL);
+     ScheduledAction* action = ScheduledAction::create(scriptState, handler);
+     return DOMTimer::install(executionContext, action, timeout, false);
+ }
+diff --git a/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp b/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
+index 4856f64d951a..af056e87e8a1 100644
+--- a/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp
+@@ -262,7 +262,7 @@ void HTMLAnchorElement::setActive(bool down)
+ void HTMLAnchorElement::parseAttribute(const QualifiedName& name, const AtomicString& oldValue, const AtomicString& value)
+ {
+     if (name == hrefAttr) {
+-        LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
++        LogIfTaintedNode(value.getString(), 1, v8::String::ANCHOR_SRC_SINK);
+ 
+         bool wasLink = isLink();
+         setIsLink(!value.isNull());
+diff --git a/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp b/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
+index b1f76d64b6c5..ccb45c5f43d8 100644
+--- a/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp
+@@ -101,7 +101,7 @@ void HTMLEmbedElement::parseAttribute(const QualifiedName& name, const AtomicStr
+     } else if (name == codeAttr) { // TODO(schenney): Remove this? It's not in the spec and we're not in the HTMLAppletElement hierarchy
+         m_url = stripLeadingAndTrailingHTMLSpaces(value);
+     } else if (name == srcAttr) {
+-        LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
++        LogIfTaintedNode(value.getString(), 1, v8::String::EMBED_SRC_SINK);
+         m_url = stripLeadingAndTrailingHTMLSpaces(value);
+         if (layoutObject() && isImageType()) {
+             if (!m_imageLoader)
+diff --git a/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp b/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
+index ad0521d9152a..82ea4d772734 100644
+--- a/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp
+@@ -121,7 +121,7 @@ void HTMLIFrameElement::parseAttribute(const QualifiedName& name, const AtomicSt
+             m_permissions->setValue(value);
+     } else {
+         if (name == srcAttr) {
+-            LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
++            LogIfTaintedNode(value.getString(), 1, v8::String::IFRAME_SRC_SINK);
+             logUpdateAttributeIfIsolatedWorldAndInDocument("iframe", srcAttr, oldValue, value);
+         }
+         HTMLFrameElementBase::parseAttribute(name, oldValue, value);
+diff --git a/third_party/WebKit/Source/core/html/HTMLImageElement.cpp b/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
+index 53c8d25d9588..7a2a831fa4ce 100644
+--- a/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLImageElement.cpp
+@@ -260,7 +260,7 @@ void HTMLImageElement::parseAttribute(const QualifiedName& name, const AtomicStr
+                 text->setTextContent(altText());
+         }
+     } else if (name == srcAttr || name == srcsetAttr || name == sizesAttr) {
+-        LogIfTaintedNode(value.getString(), 1, v8::String::URL_SINK);
++        LogIfTaintedNode(value.getString(), 1, v8::String::IMG_SRC_SINK);
+         selectSourceURL(ImageLoader::UpdateIgnorePreviousError);
+     } else if (name == usemapAttr) {
+         setIsLink(!value.isNull());
+diff --git a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+index 3554daa42129..07ddfdcbd99d 100644
+--- a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+@@ -79,7 +79,7 @@ void HTMLScriptElement::didMoveToNewDocument(Document& oldDocument)
+ void HTMLScriptElement::parseAttribute(const QualifiedName& name, const AtomicString& oldValue, const AtomicString& value)
+ {
+     if (name == srcAttr) {
+-        LogIfTaintedNode(value, 1, v8::String::TaintSinkLabel::JAVASCRIPT_URL);
++        LogIfTaintedNode(value, 1, v8::String::TaintSinkLabel::SCRIPT_SRC_URL_SINK);
+         m_loader->handleSourceAttribute(value);
+         logUpdateAttributeIfIsolatedWorldAndInDocument("script", srcAttr, oldValue, value);
+     } else if (name == asyncAttr) {
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.h b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+index d654f77fbfdb..fa47e66bf249 100644
+--- a/third_party/WebKit/Source/wtf/text/TaintTracking.h
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+@@ -13,51 +13,66 @@ class StringImpl;
+ namespace tainttracking {
+ namespace webkit {
+ 
+-// Must match the same definition in v8/include/v8.h.
++// Must match the same definition in ../../../../../v8/include/v8.h. See that
++// file for information about this datatype. We define a copy here so that the
++// wtf build doesn't have to depend on the v8 code.
+ enum TaintType {
+   UNTAINTED = 0,
+-  TAINTED,
+-  COOKIE,
+-  MESSAGE,
+-  URL,
+-  URL_HASH,
+-  URL_PROTOCOL,
+-  URL_HOST,
+-  URL_HOSTNAME,
+-  URL_ORIGIN,
+-  URL_PORT,
+-  URL_PATHNAME,
+-  URL_SEARCH,
+-  DOM,
+-  REFERRER,
+-  WINDOWNAME,
+-  STORAGE,
+-  NETWORK,
+-  MULTIPLE_TAINTS,
+-  MAX_TAINT_TYPE,
++  TAINTED = 1,
++  COOKIE = 2,
++  MESSAGE = 3,
++  URL = 4,
++  URL_HASH = 5,
++  URL_PROTOCOL = 6,
++  URL_HOST = 7,
++  URL_HOSTNAME = 8,
++  URL_ORIGIN = 9,
++  URL_PORT = 10,
++  URL_PATHNAME = 11,
++  URL_SEARCH = 12,
++  DOM = 13,
++  REFERRER = 14,
++  WINDOWNAME = 15,
++  STORAGE = 16,
++  NETWORK = 17,
++  MULTIPLE_TAINTS = 18,
++  MESSAGE_ORIGIN = 19,
++
++  MAX_TAINT_TYPE = 19,
++
++  URL_ENCODED = 32,           // 1 << 5
++  URL_COMPONENT_ENCODED = 64, // 2 << 5
++  ESCAPE_ENCODED = 96,        // 3 << 5
++  MULTIPLE_ENCODINGS = 128,   // 4 << 5
++
++  NO_ENCODING = 0,
++
++  TAINT_TYPE_MASK = 31,       // 1 << 5 - 1
++  ENCODIING_TYPE_MASK = 224   // 7 << 5
+ };
+ 
+-#define TAINT_TRACKING_TAINT_TYPE_FOR(V)        \
+-  V(UNTAINTED);                                 \
+-  V(TAINTED);                                   \
+-  V(COOKIE);                                    \
+-  V(MESSAGE);                                   \
+-  V(URL);                                       \
+-  V(URL_HASH);                                  \
+-  V(URL_PROTOCOL);                              \
+-  V(URL_HOST);                                  \
+-  V(URL_HOSTNAME);                              \
+-  V(URL_ORIGIN);                                \
+-  V(URL_PORT);                                  \
+-  V(URL_PATHNAME);                              \
+-  V(URL_SEARCH);                                \
+-  V(DOM);                                       \
+-  V(REFERRER);                                  \
+-  V(WINDOWNAME);                                \
+-  V(STORAGE);                                   \
+-  V(NETWORK);                                   \
+-  V(MULTIPLE_TAINTS);                           \
+-  V(MAX_TAINT_TYPE);
++#define TAINT_TRACKING_TAINT_TYPE_FOR(V)       \
++  V(UNTAINTED)                                 \
++  V(TAINTED)                                   \
++  V(COOKIE)                                    \
++  V(MESSAGE)                                   \
++  V(URL)                                       \
++  V(URL_HASH)                                  \
++  V(URL_PROTOCOL)                              \
++  V(URL_HOST)                                  \
++  V(URL_HOSTNAME)                              \
++  V(URL_ORIGIN)                                \
++  V(URL_PORT)                                  \
++  V(URL_PATHNAME)                              \
++  V(URL_SEARCH)                                \
++  V(DOM)                                       \
++  V(REFERRER)                                  \
++  V(WINDOWNAME)                                \
++  V(STORAGE)                                   \
++  V(NETWORK)                                   \
++  V(MULTIPLE_TAINTS)                           \
++  V(MESSAGE_ORIGIN)                            \
++  V(MAX_TAINT_TYPE)
+ 
+ typedef uint8_t TaintData;
+ 
+diff --git a/ui/events/x/events_x_utils.cc b/ui/events/x/events_x_utils.cc
+index 250851067f91..810b31c1981d 100644
+--- a/ui/events/x/events_x_utils.cc
++++ b/ui/events/x/events_x_utils.cc
+@@ -272,7 +272,7 @@ ui::EventType GetTouchEventType(const XEvent& xev) {
+       // This can happen when --touch-devices flag is used.
+       return ui::ET_UNKNOWN;
+     default:
+-      NOTREACHED();
++      return ui::ET_UNKNOWN;
+   }
+   return ui::ET_UNKNOWN;
+ }
+-- 
+2.14.1
+
+
+From 81570064cc040d25a21785e454d33969d4b39fe8 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Fri, 7 Apr 2017 14:04:42 +0600
+Subject: [PATCH 07/11] Tracking cross-origin message checking
+
+---
+ .../Source/bindings/core/v8/V8StringResource.cpp   |  1 +
+ .../Source/bindings/core/v8/V8StringResource.h     |  1 +
+ .../core/v8/custom/V8MessageEventCustom.cpp        |  1 +
+ .../WebKit/Source/core/events/MessageEvent.cpp     | 18 ++++++++++++++++
+ .../WebKit/Source/core/events/MessageEvent.h       |  3 +++
+ .../WebKit/Source/wtf/text/TaintTracking.cpp       | 24 ++++++++++++++++++++--
+ third_party/WebKit/Source/wtf/text/TaintTracking.h |  2 ++
+ 7 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+index ac091929101c..e65f8d937be3 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+@@ -75,6 +75,7 @@ void writeTaintHelper(v8::Local<v8::String> v8String, StringImpl* buffer, int le
+     ASSERT(v8String->Length() == buffer->length());
+     #endif
+     v8String->WriteTaint(tainttracking::webkit::StringTaint::FromString(buffer), 0, length);
++    v8::String::SetTaintInfo(v8String, tainttracking::webkit::StringTaint::GetTaintInfo(buffer));
+ }
+ 
+ struct V8StringTwoBytesTrait {
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h
+index 782aee338e25..ca60b90fee8b 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.h
+@@ -171,6 +171,7 @@ public:
+         return tainttracking::webkit::StringTaint::FromString(m_plainString.impl());
+     }
+ 
++
+     size_t length() const override { return m_plainString.impl()->length(); }
+     const uint16_t* data() const override
+     {
+diff --git a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+index bcf2f43aae58..8ca91572ad08 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+@@ -87,6 +87,7 @@ void V8MessageEvent::dataAttributeGetterCustom(const v8::FunctionCallbackInfo<v8
+     // result in future invocations.
+     privateCachedData.set(scriptState->context(), info.Holder(), result);
+     v8::String::SetTaint(result, info.GetIsolate(), v8::String::MESSAGE);
++    v8::String::SetTaintInfo(result, event->TaintTrackingInfo());
+     v8SetReturnValue(info, result);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/events/MessageEvent.cpp b/third_party/WebKit/Source/core/events/MessageEvent.cpp
+index 0966e1708e7a..eead8b1804c2 100644
+--- a/third_party/WebKit/Source/core/events/MessageEvent.cpp
++++ b/third_party/WebKit/Source/core/events/MessageEvent.cpp
+@@ -154,6 +154,10 @@ void MessageEvent::initMessageEvent(const AtomicString& type, bool canBubble, bo
+     m_source = source;
+     m_ports = ports;
+     m_suborigin = "";
++
++    DCHECK_NE(taint_tracking_unique_id_, -1);
++    tainttracking::webkit::StringTaint::SetTainted(m_origin.impl(), tainttracking::webkit::MESSAGE_ORIGIN);
++    tainttracking::webkit::StringTaint::SetTaintInfo(m_origin.impl(), taint_tracking_unique_id_);
+ }
+ 
+ void MessageEvent::initMessageEvent(const AtomicString& type, bool canBubble, bool cancelable, PassRefPtr<SerializedScriptValue> data, const String& origin, const String& lastEventId, DOMWindow* source, MessagePortArray* ports)
+@@ -173,6 +177,10 @@ void MessageEvent::initMessageEvent(const AtomicString& type, bool canBubble, bo
+ 
+     if (m_dataAsSerializedScriptValue)
+         m_dataAsSerializedScriptValue->registerMemoryAllocatedWithCurrentScriptContext();
++
++    DCHECK_NE(taint_tracking_unique_id_, -1);
++    tainttracking::webkit::StringTaint::SetTainted(m_origin.impl(), tainttracking::webkit::MESSAGE_ORIGIN);
++    tainttracking::webkit::StringTaint::SetTaintInfo(m_origin.impl(), taint_tracking_unique_id_);
+ }
+ 
+ const AtomicString& MessageEvent::interfaceName() const
+@@ -235,7 +243,17 @@ v8::Local<v8::Object> MessageEvent::associateWithWrapper(v8::Isolate* isolate, c
+         break;
+     }
+ 
++    taint_tracking_unique_id_ = v8::String::NewUniqueId(isolate);
++    if (m_origin.impl()) {
++        tainttracking::webkit::StringTaint::SetTainted(m_origin.impl(), tainttracking::webkit::MESSAGE_ORIGIN);
++        tainttracking::webkit::StringTaint::SetTaintInfo(m_origin.impl(), taint_tracking_unique_id_);
++    }
++
+     return wrapper;
+ }
+ 
++int64_t MessageEvent::TaintTrackingInfo() const {
++    return taint_tracking_unique_id_;
++}
++
+ } // namespace blink
+diff --git a/third_party/WebKit/Source/core/events/MessageEvent.h b/third_party/WebKit/Source/core/events/MessageEvent.h
+index b338c111c39f..f5d05a691055 100644
+--- a/third_party/WebKit/Source/core/events/MessageEvent.h
++++ b/third_party/WebKit/Source/core/events/MessageEvent.h
+@@ -114,6 +114,8 @@ public:
+ 
+     v8::Local<v8::Object> associateWithWrapper(v8::Isolate*, const WrapperTypeInfo*, v8::Local<v8::Object> wrapper) override WARN_UNUSED_RETURN;
+ 
++    int64_t TaintTrackingInfo() const;
++
+ private:
+     MessageEvent();
+     MessageEvent(const AtomicString&, const MessageEventInit&);
+@@ -140,6 +142,7 @@ private:
+     Member<MessagePortArray> m_ports;
+     std::unique_ptr<MessagePortChannelArray> m_channels;
+     String m_suborigin;
++    int64_t taint_tracking_unique_id_ = -1;
+ };
+ 
+ } // namespace blink
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.cpp b/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+index c982d589e410..b2a3ccdc5a32 100644
+--- a/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+@@ -8,7 +8,7 @@ namespace webkit {
+ 
+ // static
+ void StringTaint::InitTaintData(WTF::StringImpl* impl) {
+-  memset(FromString(impl), 0, impl->length());
++  memset(FromString(impl), 0, impl->length() + sizeof(int64_t));
+ }
+ 
+ // static
+@@ -25,7 +25,7 @@ TaintData* StringTaint::FromString(WTF::StringImpl* impl) {
+ 
+ // static
+ size_t StringTaint::AllocationSize(unsigned length) {
+-  return length * sizeof(TaintData);
++  return (length * sizeof(TaintData)) + sizeof(int64_t);
+ }
+ 
+ // static
+@@ -33,6 +33,26 @@ void StringTaint::SetTainted(WTF::StringImpl* impl, TaintType type) {
+   memset(FromString(impl), static_cast<TaintData>(type), impl->length());
+ }
+ 
++namespace {
++
++int64_t* TaintInfoFromString(WTF::StringImpl* impl) {
++  return reinterpret_cast<int64_t*>(
++      StringTaint::FromString(impl) + impl->length());
++}
++
++}
++
++
++// static
++int64_t StringTaint::GetTaintInfo(WTF::StringImpl* impl) {
++  return *TaintInfoFromString(impl);
++}
++
++// static
++void StringTaint::SetTaintInfo(WTF::StringImpl* impl, int64_t info) {
++  *TaintInfoFromString(impl) = info;
++}
++
+ 
+ } // namespace tainttracking
+ } // namespace webkit
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.h b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+index fa47e66bf249..8e7f9c1106f5 100644
+--- a/third_party/WebKit/Source/wtf/text/TaintTracking.h
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+@@ -82,6 +82,8 @@ class WTF_EXPORT StringTaint {
+   static void InitTaintData(WTF::StringImpl* impl);
+   static size_t AllocationSize(unsigned length);
+   static void SetTainted(WTF::StringImpl* impl, TaintType type);
++  static int64_t GetTaintInfo(WTF::StringImpl* impl);
++  static void SetTaintInfo(WTF::StringImpl* impl, int64_t info);
+ };
+ 
+ } // namespace tainttracking
+-- 
+2.14.1
+
+
+From e546a0ec9d1f190020a6a1e60af644b79095cca1 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Wed, 12 Apr 2017 17:03:01 +0600
+Subject: [PATCH 08/11] Fixing bugs in message origin detection
+
+---
+ .../core/v8/custom/V8MessageEventCustom.cpp        | 30 +++++++++++++++++++++-
+ .../WebKit/Source/core/events/MessageEvent.cpp     | 25 ++++++++----------
+ .../WebKit/Source/core/events/MessageEvent.h       |  5 +++-
+ .../WebKit/Source/core/events/MessageEvent.idl     |  2 +-
+ 4 files changed, 44 insertions(+), 18 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+index 8ca91572ad08..61b1bdbd265c 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+@@ -87,7 +87,35 @@ void V8MessageEvent::dataAttributeGetterCustom(const v8::FunctionCallbackInfo<v8
+     // result in future invocations.
+     privateCachedData.set(scriptState->context(), info.Holder(), result);
+     v8::String::SetTaint(result, info.GetIsolate(), v8::String::MESSAGE);
+-    v8::String::SetTaintInfo(result, event->TaintTrackingInfo());
++
++    int64_t taint_info = event->TaintTrackingInfo();
++    if (taint_info == MessageEvent::NO_INFO) {
++        taint_info = v8::String::NewUniqueId(info.GetIsolate());
++        event->SetTaintTrackingInfo(taint_info);
++    }
++    v8::String::SetTaintInfo(result, taint_info);
++    v8SetReturnValue(info, result);
++}
++
++void V8MessageEvent::originAttributeGetterCustom(const v8::FunctionCallbackInfo<v8::Value>& info)
++{
++    MessageEvent* event = V8MessageEvent::toImpl(info.Holder());
++    auto* isolate = info.GetIsolate();
++    v8::Local<v8::String> result = v8String(isolate, event->origin());
++
++    int64_t taint_info = event->TaintTrackingInfo();
++    if (taint_info == MessageEvent::NO_INFO) {
++        taint_info = v8::String::NewUniqueId(isolate);
++        event->SetTaintTrackingInfo(taint_info);
++    }
++
++    if (result->GetTaintInfo() == taint_info) {
++        v8SetReturnValue(info, result);
++        return;
++    }
++
++    v8::String::SetTaint(result, isolate, v8::String::MESSAGE_ORIGIN);
++    v8::String::SetTaintInfo(result, taint_info);
+     v8SetReturnValue(info, result);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/events/MessageEvent.cpp b/third_party/WebKit/Source/core/events/MessageEvent.cpp
+index eead8b1804c2..804dc75d8cfe 100644
+--- a/third_party/WebKit/Source/core/events/MessageEvent.cpp
++++ b/third_party/WebKit/Source/core/events/MessageEvent.cpp
+@@ -32,6 +32,7 @@
+ #include "bindings/core/v8/V8ArrayBuffer.h"
+ #include "bindings/core/v8/V8PrivateProperty.h"
+ #include <memory>
++#include <iostream>
+ 
+ namespace blink {
+ 
+@@ -156,8 +157,6 @@ void MessageEvent::initMessageEvent(const AtomicString& type, bool canBubble, bo
+     m_suborigin = "";
+ 
+     DCHECK_NE(taint_tracking_unique_id_, -1);
+-    tainttracking::webkit::StringTaint::SetTainted(m_origin.impl(), tainttracking::webkit::MESSAGE_ORIGIN);
+-    tainttracking::webkit::StringTaint::SetTaintInfo(m_origin.impl(), taint_tracking_unique_id_);
+ }
+ 
+ void MessageEvent::initMessageEvent(const AtomicString& type, bool canBubble, bool cancelable, PassRefPtr<SerializedScriptValue> data, const String& origin, const String& lastEventId, DOMWindow* source, MessagePortArray* ports)
+@@ -177,10 +176,6 @@ void MessageEvent::initMessageEvent(const AtomicString& type, bool canBubble, bo
+ 
+     if (m_dataAsSerializedScriptValue)
+         m_dataAsSerializedScriptValue->registerMemoryAllocatedWithCurrentScriptContext();
+-
+-    DCHECK_NE(taint_tracking_unique_id_, -1);
+-    tainttracking::webkit::StringTaint::SetTainted(m_origin.impl(), tainttracking::webkit::MESSAGE_ORIGIN);
+-    tainttracking::webkit::StringTaint::SetTaintInfo(m_origin.impl(), taint_tracking_unique_id_);
+ }
+ 
+ const AtomicString& MessageEvent::interfaceName() const
+@@ -222,6 +217,15 @@ DEFINE_TRACE(MessageEvent)
+     Event::trace(visitor);
+ }
+ 
++int64_t MessageEvent::TaintTrackingInfo() const {
++    return taint_tracking_unique_id_;
++}
++
++void MessageEvent::SetTaintTrackingInfo(int64_t info) {
++    taint_tracking_unique_id_ = info;
++}
++
++
+ v8::Local<v8::Object> MessageEvent::associateWithWrapper(v8::Isolate* isolate, const WrapperTypeInfo* wrapperType, v8::Local<v8::Object> wrapper)
+ {
+     wrapper = Event::associateWithWrapper(isolate, wrapperType, wrapper);
+@@ -243,17 +247,8 @@ v8::Local<v8::Object> MessageEvent::associateWithWrapper(v8::Isolate* isolate, c
+         break;
+     }
+ 
+-    taint_tracking_unique_id_ = v8::String::NewUniqueId(isolate);
+-    if (m_origin.impl()) {
+-        tainttracking::webkit::StringTaint::SetTainted(m_origin.impl(), tainttracking::webkit::MESSAGE_ORIGIN);
+-        tainttracking::webkit::StringTaint::SetTaintInfo(m_origin.impl(), taint_tracking_unique_id_);
+-    }
+ 
+     return wrapper;
+ }
+ 
+-int64_t MessageEvent::TaintTrackingInfo() const {
+-    return taint_tracking_unique_id_;
+-}
+-
+ } // namespace blink
+diff --git a/third_party/WebKit/Source/core/events/MessageEvent.h b/third_party/WebKit/Source/core/events/MessageEvent.h
+index f5d05a691055..f6de3b0cf17e 100644
+--- a/third_party/WebKit/Source/core/events/MessageEvent.h
++++ b/third_party/WebKit/Source/core/events/MessageEvent.h
+@@ -44,6 +44,8 @@ namespace blink {
+ class CORE_EXPORT MessageEvent final : public Event {
+     DEFINE_WRAPPERTYPEINFO();
+ public:
++    static const int NO_INFO = -1;
++
+     static MessageEvent* create()
+     {
+         return new MessageEvent;
+@@ -115,6 +117,7 @@ public:
+     v8::Local<v8::Object> associateWithWrapper(v8::Isolate*, const WrapperTypeInfo*, v8::Local<v8::Object> wrapper) override WARN_UNUSED_RETURN;
+ 
+     int64_t TaintTrackingInfo() const;
++    void SetTaintTrackingInfo(int64_t);
+ 
+ private:
+     MessageEvent();
+@@ -142,7 +145,7 @@ private:
+     Member<MessagePortArray> m_ports;
+     std::unique_ptr<MessagePortChannelArray> m_channels;
+     String m_suborigin;
+-    int64_t taint_tracking_unique_id_ = -1;
++    int64_t taint_tracking_unique_id_ = NO_INFO;
+ };
+ 
+ } // namespace blink
+diff --git a/third_party/WebKit/Source/core/events/MessageEvent.idl b/third_party/WebKit/Source/core/events/MessageEvent.idl
+index b8a5265f1bf6..9fee731011dc 100644
+--- a/third_party/WebKit/Source/core/events/MessageEvent.idl
++++ b/third_party/WebKit/Source/core/events/MessageEvent.idl
+@@ -33,7 +33,7 @@
+     RaisesException=Constructor,
+ ] interface MessageEvent : Event {
+     [Custom=Getter] readonly attribute any data;
+-    readonly attribute DOMString origin;
++    [Custom=Getter] readonly attribute DOMString origin;
+     readonly attribute DOMString lastEventId;
+     // TODO(bashi): |source| should be (WindowProxy or MessagePort)?
+     readonly attribute EventTarget? source;
+-- 
+2.14.1
+
+
+From c0d77e06e479c1005e39458030c4cb2ef32f4937 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Wed, 26 Apr 2017 11:24:52 -0400
+Subject: [PATCH 09/11] Modifying message tracking
+
+---
+ third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp   | 12 ++++++++++++
+ .../Source/bindings/core/v8/custom/V8MessageEventCustom.cpp  |  4 +++-
+ third_party/WebKit/Source/core/events/MessageEvent.h         |  5 ++++-
+ 3 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+index e429e5af70f2..83caf83f09f8 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+@@ -44,6 +44,7 @@
+ #include "bindings/core/v8/V8PagePopupControllerBinding.h"
+ #include "bindings/core/v8/V8Window.h"
+ #include "core/frame/LocalFrame.h"
++#include "core/frame/Location.h"
+ #include "core/frame/csp/ContentSecurityPolicy.h"
+ #include "core/html/DocumentNameCollection.h"
+ #include "core/html/HTMLCollection.h"
+@@ -431,6 +432,7 @@ void WindowProxy::setSecurityToken(SecurityOrigin* origin)
+     // If two tokens are not equal, then we have to call canAccess.
+     // Note: we can't use the HTTPOrigin if it was set from the DOM.
+     String token;
++
+     // There are several situations where v8 needs to do a full canAccess check,
+     // so set an empty security token instead:
+     // - document.domain was modified
+@@ -485,6 +487,16 @@ void WindowProxy::updateDocument()
+     updateActivityLogger();
+     updateDocumentProperty();
+     updateSecurityOrigin(m_frame->securityContext()->getSecurityOrigin());
++
++
++    // Update the taint tracking id for the window
++    if (m_frame->isLocalFrame()) {
++        m_scriptState->context()->SetTaintTrackingContextId(
++            v8String(m_isolate, m_frame->domWindow()->location()->href()));
++    } else {
++        m_scriptState->context()->SetTaintTrackingContextId(
++                v8String(m_isolate, "NON_LOCAL_FRAME"));
++    }
+ }
+ 
+ static v8::Local<v8::Value> getNamedProperty(HTMLDocument* htmlDocument, const AtomicString& key, v8::Local<v8::Object> creationContext, v8::Isolate* isolate)
+diff --git a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+index 61b1bdbd265c..038c1b497066 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
+@@ -104,10 +104,12 @@ void V8MessageEvent::originAttributeGetterCustom(const v8::FunctionCallbackInfo<
+     v8::Local<v8::String> result = v8String(isolate, event->origin());
+ 
+     int64_t taint_info = event->TaintTrackingInfo();
+-    if (taint_info == MessageEvent::NO_INFO) {
++    if (taint_info == MessageEvent_NO_INFO) {
+         taint_info = v8::String::NewUniqueId(isolate);
+         event->SetTaintTrackingInfo(taint_info);
+     }
++    DCHECK_NE(taint_info, 0);
++    DCHECK_NE(taint_info, MessageEvent_NO_INFO);
+ 
+     if (result->GetTaintInfo() == taint_info) {
+         v8SetReturnValue(info, result);
+diff --git a/third_party/WebKit/Source/core/events/MessageEvent.h b/third_party/WebKit/Source/core/events/MessageEvent.h
+index f6de3b0cf17e..0d523425f038 100644
+--- a/third_party/WebKit/Source/core/events/MessageEvent.h
++++ b/third_party/WebKit/Source/core/events/MessageEvent.h
+@@ -39,12 +39,15 @@
+ #include "core/frame/DOMWindow.h"
+ #include <memory>
+ 
++// Defined as a macro to prevent linker errors in GCC
++#define MessageEvent_NO_INFO -1
++
+ namespace blink {
+ 
+ class CORE_EXPORT MessageEvent final : public Event {
+     DEFINE_WRAPPERTYPEINFO();
+ public:
+-    static const int NO_INFO = -1;
++    static const int NO_INFO = MessageEvent_NO_INFO;
+ 
+     static MessageEvent* create()
+     {
+-- 
+2.14.1
+
+
+From 0ebdd02c6dcfb9da4d528a94a86498aaa2c4aa55 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Wed, 21 Jun 2017 15:03:06 -0400
+Subject: [PATCH 10/11] Fixing bug where about:blank urls do not get updated
+ when the document loads
+
+---
+ .../Source/bindings/core/v8/ScriptController.cpp   |  4 ++++
+ .../Source/bindings/core/v8/ScriptController.h     |  1 +
+ .../WebKit/Source/bindings/core/v8/WindowProxy.cpp | 25 ++++++++++++++--------
+ .../WebKit/Source/bindings/core/v8/WindowProxy.h   |  2 ++
+ third_party/WebKit/Source/core/dom/Document.cpp    |  3 +++
+ third_party/WebKit/Source/core/frame/Location.cpp  | 12 +++++++++++
+ third_party/WebKit/Source/core/page/FrameTree.cpp  |  5 +++++
+ .../WebKit/Source/modules/storage/StorageArea.cpp  |  5 ++++-
+ .../WebKit/Source/wtf/text/TaintTracking.cpp       | 20 +++++++++++++----
+ 9 files changed, 63 insertions(+), 14 deletions(-)
+
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptController.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptController.cpp
+index fb9ae287cd5a..3d6264840492 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptController.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptController.cpp
+@@ -111,6 +111,10 @@ void ScriptController::updateSecurityOrigin(SecurityOrigin* origin)
+         m_windowProxyManager->windowProxy(isolatedContext.first->world())->updateSecurityOrigin(isolatedContext.second);
+ }
+ 
++void ScriptController::updateTaintTrackingContextId() {
++    m_windowProxyManager->mainWorldProxy()->updateTaintTrackingContextId();
++}
++
+ v8::Local<v8::Value> ScriptController::executeScriptAndReturnValue(v8::Local<v8::Context> context, const ScriptSourceCode& source, AccessControlStatus accessControlStatus)
+ {
+     TRACE_EVENT1("devtools.timeline", "EvaluateScript", "data", InspectorEvaluateScriptEvent::data(frame(), source.url().getString(), source.startPosition()));
+diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptController.h b/third_party/WebKit/Source/bindings/core/v8/ScriptController.h
+index 2779e0fc10ad..05634d77db2d 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/ScriptController.h
++++ b/third_party/WebKit/Source/bindings/core/v8/ScriptController.h
+@@ -128,6 +128,7 @@ public:
+     void namedItemRemoved(HTMLDocument*, const AtomicString&);
+ 
+     void updateSecurityOrigin(SecurityOrigin*);
++    void updateTaintTrackingContextId();
+ 
+     void clearForClose();
+ 
+diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+index 83caf83f09f8..206c1630c424 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+@@ -488,15 +488,7 @@ void WindowProxy::updateDocument()
+     updateDocumentProperty();
+     updateSecurityOrigin(m_frame->securityContext()->getSecurityOrigin());
+ 
+-
+-    // Update the taint tracking id for the window
+-    if (m_frame->isLocalFrame()) {
+-        m_scriptState->context()->SetTaintTrackingContextId(
+-            v8String(m_isolate, m_frame->domWindow()->location()->href()));
+-    } else {
+-        m_scriptState->context()->SetTaintTrackingContextId(
+-                v8String(m_isolate, "NON_LOCAL_FRAME"));
+-    }
++    updateTaintTrackingContextId();
+ }
+ 
+ static v8::Local<v8::Value> getNamedProperty(HTMLDocument* htmlDocument, const AtomicString& key, v8::Local<v8::Object> creationContext, v8::Isolate* isolate)
+@@ -576,4 +568,19 @@ void WindowProxy::updateSecurityOrigin(SecurityOrigin* origin)
+     setSecurityToken(origin);
+ }
+ 
++void WindowProxy::updateTaintTrackingContextId()
++{
++    // Update the taint tracking id for the window
++    v8::HandleScope scope(m_isolate);
++    if (m_frame && m_scriptState) {
++        if (m_frame->isLocalFrame()) {
++            m_scriptState->context()->SetTaintTrackingContextId(
++                    v8String(m_isolate, m_frame->domWindow()->location()->href()));
++        } else {
++            m_scriptState->context()->SetTaintTrackingContextId(
++                    v8String(m_isolate, "NON_LOCAL_FRAME"));
++        }
++    }
++}
++
+ } // namespace blink
+diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.h b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.h
+index 0765d0248a94..62ecbf7207d4 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.h
++++ b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.h
+@@ -70,6 +70,8 @@ public:
+     // (e.g., after setting docoument.domain).
+     void updateSecurityOrigin(SecurityOrigin*);
+ 
++    void updateTaintTrackingContextId();
++
+     bool isContextInitialized() { return m_scriptState && !!m_scriptState->perContextData(); }
+     bool isGlobalInitialized() { return !m_global.isEmpty(); }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
+index 4d1b081d7eb3..3c1a422f4510 100644
+--- a/third_party/WebKit/Source/core/dom/Document.cpp
++++ b/third_party/WebKit/Source/core/dom/Document.cpp
+@@ -2917,6 +2917,9 @@ void Document::setURL(const KURL& url)
+     m_accessEntryFromURL = nullptr;
+     updateBaseURL();
+     contextFeatures().urlDidChange(this);
++
++    if (m_frame)
++        m_frame->script().updateTaintTrackingContextId();
+ }
+ 
+ KURL Document::validBaseElementURL() const
+diff --git a/third_party/WebKit/Source/core/frame/Location.cpp b/third_party/WebKit/Source/core/frame/Location.cpp
+index 41482cfe28fa..60c1a3ec0db0 100644
+--- a/third_party/WebKit/Source/core/frame/Location.cpp
++++ b/third_party/WebKit/Source/core/frame/Location.cpp
+@@ -283,6 +283,18 @@ void Location::setLocation(const String& url, LocalDOMWindow* currentWindow, Loc
+     if (!enteredDocument)
+         return;
+ 
++
++    LocalFrame* frame = enteredDocument->frame();
++    if (frame) {
++        ScriptState* scriptState = ScriptState::forMainWorld(frame);
++        if (scriptState) {
++            scriptState->LogIfTainted(
++                    url, 0, v8::String::TaintSinkLabel::LOCATION_ASSIGNMENT);
++        }
++    }
++
++
++
+     KURL completedURL = enteredDocument->completeURL(url);
+     if (completedURL.isNull())
+         return;
+diff --git a/third_party/WebKit/Source/core/page/FrameTree.cpp b/third_party/WebKit/Source/core/page/FrameTree.cpp
+index 5742191df101..da7580e7a19e 100644
+--- a/third_party/WebKit/Source/core/page/FrameTree.cpp
++++ b/third_party/WebKit/Source/core/page/FrameTree.cpp
+@@ -72,6 +72,8 @@ void FrameTree::setName(const AtomicString& name)
+         return;
+ 
+     m_name = name;
++    tainttracking::webkit::StringTaint::SetTainted(
++            m_name.impl(), tainttracking::webkit::TaintType::WINDOWNAME);
+ 
+     // Remove our old frame name so it's not considered in calculateUniqueNameForChildFrame
+     // and appendUniqueSuffix calls below.
+@@ -99,6 +101,8 @@ void FrameTree::setPrecalculatedName(const AtomicString& name, const AtomicStrin
+     }
+ 
+     m_name = name;
++    tainttracking::webkit::StringTaint::SetTainted(
++            m_name.impl(), tainttracking::webkit::TaintType::WINDOWNAME);
+ 
+     // TODO(lukasza): We would like to assert uniqueness below (i.e. by calling
+     // setUniqueName), but
+@@ -551,6 +555,7 @@ Frame* FrameTree::deepLastChild() const
+     return result;
+ }
+ 
++
+ DEFINE_TRACE(FrameTree)
+ {
+     visitor->trace(m_thisFrame);
+diff --git a/third_party/WebKit/Source/modules/storage/StorageArea.cpp b/third_party/WebKit/Source/modules/storage/StorageArea.cpp
+index 7447f5bdaff1..878be5c26789 100644
+--- a/third_party/WebKit/Source/modules/storage/StorageArea.cpp
++++ b/third_party/WebKit/Source/modules/storage/StorageArea.cpp
+@@ -93,7 +93,10 @@ String StorageArea::getItem(const String& key, ExceptionState& exceptionState, L
+         exceptionState.throwSecurityError("access is denied for this document.");
+         return String();
+     }
+-    return m_storageArea->getItem(key);
++
++    String answer = m_storageArea->getItem(key);
++    tainttracking::webkit::StringTaint::SetTainted(answer.impl(), tainttracking::webkit::TaintType::STORAGE);
++    return answer;
+ }
+ 
+ void StorageArea::setItem(const String& key, const String& value, ExceptionState& exceptionState, LocalFrame* frame)
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.cpp b/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+index b2a3ccdc5a32..1fa3c95b474e 100644
+--- a/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.cpp
+@@ -8,11 +8,17 @@ namespace webkit {
+ 
+ // static
+ void StringTaint::InitTaintData(WTF::StringImpl* impl) {
+-  memset(FromString(impl), 0, impl->length() + sizeof(int64_t));
++  if (impl) {
++    memset(FromString(impl), 0, impl->length() + sizeof(int64_t));
++  }
+ }
+ 
+ // static
+ TaintData* StringTaint::FromString(WTF::StringImpl* impl) {
++  if (!impl) {
++    return nullptr;
++  }
++
+   size_t len = impl->length();
+   if (impl->is8Bit()) {
+     return reinterpret_cast<TaintData*>(
+@@ -30,14 +36,20 @@ size_t StringTaint::AllocationSize(unsigned length) {
+ 
+ // static
+ void StringTaint::SetTainted(WTF::StringImpl* impl, TaintType type) {
+-  memset(FromString(impl), static_cast<TaintData>(type), impl->length());
++  if (impl) {
++    memset(FromString(impl), static_cast<TaintData>(type), impl->length());
++  }
+ }
+ 
+ namespace {
+ 
+ int64_t* TaintInfoFromString(WTF::StringImpl* impl) {
+-  return reinterpret_cast<int64_t*>(
+-      StringTaint::FromString(impl) + impl->length());
++  if (impl) {
++    return reinterpret_cast<int64_t*>(
++        StringTaint::FromString(impl) + impl->length());
++  } else {
++    return nullptr;
++  }
+ }
+ 
+ }
+-- 
+2.14.1
+
+
+From d32a31c70112cc8f87e063160f8f6fe97f151485 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Tue, 3 Oct 2017 14:31:33 -0400
+Subject: [PATCH 11/11] Uncommited file
+
+---
+ third_party/WebKit/Source/core/frame/Location.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/WebKit/Source/core/frame/Location.cpp b/third_party/WebKit/Source/core/frame/Location.cpp
+index 60c1a3ec0db0..964c12cd2c32 100644
+--- a/third_party/WebKit/Source/core/frame/Location.cpp
++++ b/third_party/WebKit/Source/core/frame/Location.cpp
+@@ -53,7 +53,16 @@ DEFINE_TRACE(Location)
+ 
+ inline const KURL& Location::url() const
+ {
+-    const KURL& url = toLocalFrame(m_frame)->document()->url();
++    auto* local_frame = toLocalFrame(m_frame);
++    if (!local_frame) {
++        return blankURL();
++    }
++    auto* document = local_frame->document();
++    if (!document) {
++        return blankURL();
++    }
++
++    const KURL& url = document->url();
+     if (!url.isValid())
+         return blankURL(); // Use "about:blank" while the page is still loading (before we have a frame).
+ 
+-- 
+2.14.1
+
