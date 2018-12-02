@@ -1,6 +1,11 @@
 Installation
 ------------
 
+Because of the difficulty with setting up a Chromium source code development
+environment from the past, on request, we can distribute a virtual machine with
+the development environment already set up.
+
+
 Currently only supports x64 build.
 
 Follow the directions to download chromium source code here:

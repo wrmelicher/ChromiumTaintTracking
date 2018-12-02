@@ -1,25 +1,25 @@
 From ebf3537036a7cdb114d7875fb79458de11fd1205 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Sat, 17 Dec 2016 13:07:27 -0500
-Subject: [PATCH 01/11] Adding support for webkit to check and set taint
+Subject: [PATCH 01/13] Adding support for webkit to check and set taint
 
 current version only sets taint on url's and checks taint for innerhtml/outerhtml
 ---
- .../static_v8_external_one_byte_string_resource.h  |  3 +-
- net/proxy/proxy_resolver_v8.cc                     |  6 ++-
- .../WebKit/Source/bindings/core/v8/ScriptState.cpp | 24 +++++++++
- .../WebKit/Source/bindings/core/v8/ScriptState.h   |  2 +
- .../Source/bindings/core/v8/V8StringResource.cpp   | 23 ++++++++-
- .../Source/bindings/core/v8/V8StringResource.h     | 22 +++++++-
- third_party/WebKit/Source/core/dom/Element.cpp     | 22 ++++++++
- third_party/WebKit/Source/core/dom/Element.h       |  6 +++
- third_party/WebKit/Source/core/dom/Element.idl     |  4 +-
- third_party/WebKit/Source/core/frame/Location.cpp  | 37 +++++++++++---
- third_party/WebKit/Source/wtf/text/StringImpl.cpp  | 15 ++++--
- third_party/WebKit/Source/wtf/text/StringImpl.h    |  7 ++-
- .../WebKit/Source/wtf/text/TaintTracking.cpp       | 38 ++++++++++++++
- third_party/WebKit/Source/wtf/text/TaintTracking.h | 59 ++++++++++++++++++++++
- third_party/WebKit/Source/wtf/wtf.gypi             |  2 +
+ ...tic_v8_external_one_byte_string_resource.h |  3 +-
+ net/proxy/proxy_resolver_v8.cc                |  6 +-
+ .../Source/bindings/core/v8/ScriptState.cpp   | 24 ++++++++
+ .../Source/bindings/core/v8/ScriptState.h     |  2 +
+ .../bindings/core/v8/V8StringResource.cpp     | 23 +++++++-
+ .../bindings/core/v8/V8StringResource.h       | 22 ++++++-
+ .../WebKit/Source/core/dom/Element.cpp        | 22 +++++++
+ third_party/WebKit/Source/core/dom/Element.h  |  6 ++
+ .../WebKit/Source/core/dom/Element.idl        |  4 +-
+ .../WebKit/Source/core/frame/Location.cpp     | 37 +++++++++---
+ .../WebKit/Source/wtf/text/StringImpl.cpp     | 15 +++--
+ .../WebKit/Source/wtf/text/StringImpl.h       |  7 ++-
+ .../WebKit/Source/wtf/text/TaintTracking.cpp  | 38 ++++++++++++
+ .../WebKit/Source/wtf/text/TaintTracking.h    | 59 +++++++++++++++++++
+ third_party/WebKit/Source/wtf/wtf.gypi        |  2 +
  15 files changed, 250 insertions(+), 20 deletions(-)
  create mode 100644 third_party/WebKit/Source/wtf/text/TaintTracking.cpp
  create mode 100644 third_party/WebKit/Source/wtf/text/TaintTracking.h
@@ -608,22 +608,22 @@ index c18f1a2ddfd2..bb0cdf45d9a9 100644
              'text/TextCodec.cpp',
              'text/TextCodecASCIIFastPath.h',
 -- 
-2.14.1
+2.17.1
 
 
 From 8e3a287fec67f066d075832655f2bf0170739eb6 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Mon, 19 Dec 2016 14:08:50 -0500
-Subject: [PATCH 02/11] New version of taint checking which does not require
+Subject: [PATCH 02/13] New version of taint checking which does not require
  idl changes
 
 ---
- third_party/WebKit/Source/core/dom/Document.cpp | 10 +++++++--
- third_party/WebKit/Source/core/dom/Element.cpp  | 28 ++++++-------------------
- third_party/WebKit/Source/core/dom/Element.h    |  6 ------
- third_party/WebKit/Source/core/dom/Element.idl  |  4 ++--
- third_party/WebKit/Source/core/dom/Node.cpp     | 11 ++++++++++
- third_party/WebKit/Source/core/dom/Node.h       |  2 ++
+ .../WebKit/Source/core/dom/Document.cpp       | 10 +++++--
+ .../WebKit/Source/core/dom/Element.cpp        | 28 ++++---------------
+ third_party/WebKit/Source/core/dom/Element.h  |  6 ----
+ .../WebKit/Source/core/dom/Element.idl        |  4 +--
+ third_party/WebKit/Source/core/dom/Node.cpp   | 11 ++++++++
+ third_party/WebKit/Source/core/dom/Node.h     |  2 ++
  6 files changed, 29 insertions(+), 32 deletions(-)
 
 diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
@@ -808,21 +808,21 @@ index 2d03e74c8fea..9fbac4e4b86c 100644
      {
          DCHECK(m_treeScope);
 -- 
-2.14.1
+2.17.1
 
 
 From f001ff5961ce34dce19c018657e597559a2115ff Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Wed, 21 Dec 2016 18:24:35 -0500
-Subject: [PATCH 03/11] Adding taint setting/checking for post message,
+Subject: [PATCH 03/13] Adding taint setting/checking for post message,
  document referrer, script set src or text
 
 ---
- .../WebKit/Source/bindings/core/v8/V8StringResource.cpp        |  4 ++++
- .../Source/bindings/core/v8/custom/V8MessageEventCustom.cpp    |  1 +
- third_party/WebKit/Source/core/dom/Document.cpp                | 10 ++++++++--
- third_party/WebKit/Source/core/dom/Node.cpp                    |  1 +
- third_party/WebKit/Source/core/html/HTMLScriptElement.cpp      |  2 ++
+ .../Source/bindings/core/v8/V8StringResource.cpp       |  4 ++++
+ .../bindings/core/v8/custom/V8MessageEventCustom.cpp   |  1 +
+ third_party/WebKit/Source/core/dom/Document.cpp        | 10 ++++++++--
+ third_party/WebKit/Source/core/dom/Node.cpp            |  1 +
+ .../WebKit/Source/core/html/HTMLScriptElement.cpp      |  2 ++
  5 files changed, 16 insertions(+), 2 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
@@ -906,24 +906,24 @@ index 94e7479c784a..3513ddb5d53a 100644
  }
  
 -- 
-2.14.1
+2.17.1
 
 
 From 5128032360268c3440c5b7ec8d4ce6faf84db84d Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Thu, 22 Dec 2016 14:58:10 -0500
-Subject: [PATCH 04/11] Adding taint checking for urls in <a>, <embed>,
+Subject: [PATCH 04/13] Adding taint checking for urls in <a>, <embed>,
  <iframe>, <img> Adding logging document url on load
 
 ---
- third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp |  4 ++++
- third_party/WebKit/Source/core/dom/Document.cpp            |  6 +++++-
- third_party/WebKit/Source/core/dom/Element.cpp             |  8 ++++++++
- third_party/WebKit/Source/core/dom/Node.cpp                | 12 +++++++-----
- third_party/WebKit/Source/core/html/HTMLAnchorElement.cpp  |  2 ++
- third_party/WebKit/Source/core/html/HTMLEmbedElement.cpp   |  1 +
- third_party/WebKit/Source/core/html/HTMLIFrameElement.cpp  |  4 +++-
- third_party/WebKit/Source/core/html/HTMLImageElement.cpp   |  1 +
+ .../WebKit/Source/bindings/core/v8/WindowProxy.cpp   |  4 ++++
+ third_party/WebKit/Source/core/dom/Document.cpp      |  6 +++++-
+ third_party/WebKit/Source/core/dom/Element.cpp       |  8 ++++++++
+ third_party/WebKit/Source/core/dom/Node.cpp          | 12 +++++++-----
+ .../WebKit/Source/core/html/HTMLAnchorElement.cpp    |  2 ++
+ .../WebKit/Source/core/html/HTMLEmbedElement.cpp     |  1 +
+ .../WebKit/Source/core/html/HTMLIFrameElement.cpp    |  4 +++-
+ .../WebKit/Source/core/html/HTMLImageElement.cpp     |  1 +
  8 files changed, 31 insertions(+), 7 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
@@ -1061,28 +1061,28 @@ index 25baa498a4e7..bec387ab1e94 100644
      } else if (name == usemapAttr) {
          setIsLink(!value.isNull());
 -- 
-2.14.1
+2.17.1
 
 
 From 59d05d0f12b77e056b41dd859293cf8257892dc0 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Sun, 5 Mar 2017 16:51:20 -0500
-Subject: [PATCH 05/11] Committing old changes to webkit adding taints
+Subject: [PATCH 05/13] Committing old changes to webkit adding taints
 
 ---
- .../WebKit/Source/bindings/core/v8/ScriptState.cpp | 11 ++++++
- .../WebKit/Source/bindings/core/v8/ScriptState.h   |  4 ++-
- third_party/WebKit/Source/core/dom/Document.cpp    | 10 +++---
- third_party/WebKit/Source/core/dom/Element.cpp     | 10 +++---
- third_party/WebKit/Source/core/dom/Node.cpp        |  6 ++--
- third_party/WebKit/Source/core/dom/Node.h          |  2 +-
- third_party/WebKit/Source/core/frame/Location.cpp  | 25 +++++++++-----
- .../WebKit/Source/core/html/HTMLAnchorElement.cpp  |  2 +-
- .../WebKit/Source/core/html/HTMLEmbedElement.cpp   |  2 +-
- .../WebKit/Source/core/html/HTMLIFrameElement.cpp  |  2 +-
- .../WebKit/Source/core/html/HTMLImageElement.cpp   |  2 +-
- .../WebKit/Source/core/html/HTMLScriptElement.cpp  |  4 +--
- third_party/WebKit/Source/wtf/text/TaintTracking.h | 40 +++++++++++++++-------
+ .../Source/bindings/core/v8/ScriptState.cpp   | 11 +++++
+ .../Source/bindings/core/v8/ScriptState.h     |  4 +-
+ .../WebKit/Source/core/dom/Document.cpp       | 10 ++---
+ .../WebKit/Source/core/dom/Element.cpp        | 10 ++---
+ third_party/WebKit/Source/core/dom/Node.cpp   |  6 ++-
+ third_party/WebKit/Source/core/dom/Node.h     |  2 +-
+ .../WebKit/Source/core/frame/Location.cpp     | 25 +++++++-----
+ .../Source/core/html/HTMLAnchorElement.cpp    |  2 +-
+ .../Source/core/html/HTMLEmbedElement.cpp     |  2 +-
+ .../Source/core/html/HTMLIFrameElement.cpp    |  2 +-
+ .../Source/core/html/HTMLImageElement.cpp     |  2 +-
+ .../Source/core/html/HTMLScriptElement.cpp    |  4 +-
+ .../WebKit/Source/wtf/text/TaintTracking.h    | 40 +++++++++++++------
  13 files changed, 79 insertions(+), 41 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
@@ -1495,27 +1495,27 @@ index 04699ef8908e..d654f77fbfdb 100644
  
  typedef uint8_t TaintData;
 -- 
-2.14.1
+2.17.1
 
 
 From 379fa1928d459ef8635523af2ef943c872620d74 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Thu, 23 Mar 2017 14:55:14 -0400
-Subject: [PATCH 06/11] Adding changes to track different types of url sinks
+Subject: [PATCH 06/13] Adding changes to track different types of url sinks
 
 ---
- .../WebKit/Source/bindings/core/v8/ScriptState.cpp | 10 +++
- .../WebKit/Source/bindings/core/v8/ScriptState.h   |  2 +
- .../Source/bindings/core/v8/V8StringResource.cpp   |  3 +-
- third_party/WebKit/Source/core/dom/Element.cpp     |  3 +-
- .../WebKit/Source/core/frame/DOMWindowTimers.cpp   | 26 ++++++
- .../WebKit/Source/core/html/HTMLAnchorElement.cpp  |  2 +-
- .../WebKit/Source/core/html/HTMLEmbedElement.cpp   |  2 +-
- .../WebKit/Source/core/html/HTMLIFrameElement.cpp  |  2 +-
- .../WebKit/Source/core/html/HTMLImageElement.cpp   |  2 +-
- .../WebKit/Source/core/html/HTMLScriptElement.cpp  |  2 +-
- third_party/WebKit/Source/wtf/text/TaintTracking.h | 97 +++++++++++++---------
- ui/events/x/events_x_utils.cc                      |  2 +-
+ .../Source/bindings/core/v8/ScriptState.cpp   | 10 ++
+ .../Source/bindings/core/v8/ScriptState.h     |  2 +
+ .../bindings/core/v8/V8StringResource.cpp     |  3 +-
+ .../WebKit/Source/core/dom/Element.cpp        |  3 +-
+ .../Source/core/frame/DOMWindowTimers.cpp     | 26 +++++
+ .../Source/core/html/HTMLAnchorElement.cpp    |  2 +-
+ .../Source/core/html/HTMLEmbedElement.cpp     |  2 +-
+ .../Source/core/html/HTMLIFrameElement.cpp    |  2 +-
+ .../Source/core/html/HTMLImageElement.cpp     |  2 +-
+ .../Source/core/html/HTMLScriptElement.cpp    |  2 +-
+ .../WebKit/Source/wtf/text/TaintTracking.h    | 97 +++++++++++--------
+ ui/events/x/events_x_utils.cc                 |  2 +-
  12 files changed, 104 insertions(+), 49 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptState.cpp
@@ -1839,22 +1839,22 @@ index 250851067f91..810b31c1981d 100644
    return ui::ET_UNKNOWN;
  }
 -- 
-2.14.1
+2.17.1
 
 
 From 81570064cc040d25a21785e454d33969d4b39fe8 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Fri, 7 Apr 2017 14:04:42 +0600
-Subject: [PATCH 07/11] Tracking cross-origin message checking
+Subject: [PATCH 07/13] Tracking cross-origin message checking
 
 ---
- .../Source/bindings/core/v8/V8StringResource.cpp   |  1 +
- .../Source/bindings/core/v8/V8StringResource.h     |  1 +
- .../core/v8/custom/V8MessageEventCustom.cpp        |  1 +
- .../WebKit/Source/core/events/MessageEvent.cpp     | 18 ++++++++++++++++
- .../WebKit/Source/core/events/MessageEvent.h       |  3 +++
- .../WebKit/Source/wtf/text/TaintTracking.cpp       | 24 ++++++++++++++++++++--
- third_party/WebKit/Source/wtf/text/TaintTracking.h |  2 ++
+ .../bindings/core/v8/V8StringResource.cpp     |  1 +
+ .../bindings/core/v8/V8StringResource.h       |  1 +
+ .../core/v8/custom/V8MessageEventCustom.cpp   |  1 +
+ .../Source/core/events/MessageEvent.cpp       | 18 ++++++++++++++
+ .../WebKit/Source/core/events/MessageEvent.h  |  3 +++
+ .../WebKit/Source/wtf/text/TaintTracking.cpp  | 24 +++++++++++++++++--
+ .../WebKit/Source/wtf/text/TaintTracking.h    |  2 ++
  7 files changed, 48 insertions(+), 2 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
@@ -2021,19 +2021,19 @@ index fa47e66bf249..8e7f9c1106f5 100644
  
  } // namespace tainttracking
 -- 
-2.14.1
+2.17.1
 
 
 From e546a0ec9d1f190020a6a1e60af644b79095cca1 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Wed, 12 Apr 2017 17:03:01 +0600
-Subject: [PATCH 08/11] Fixing bugs in message origin detection
+Subject: [PATCH 08/13] Fixing bugs in message origin detection
 
 ---
- .../core/v8/custom/V8MessageEventCustom.cpp        | 30 +++++++++++++++++++++-
- .../WebKit/Source/core/events/MessageEvent.cpp     | 25 ++++++++----------
- .../WebKit/Source/core/events/MessageEvent.h       |  5 +++-
- .../WebKit/Source/core/events/MessageEvent.idl     |  2 +-
+ .../core/v8/custom/V8MessageEventCustom.cpp   | 30 ++++++++++++++++++-
+ .../Source/core/events/MessageEvent.cpp       | 25 +++++++---------
+ .../WebKit/Source/core/events/MessageEvent.h  |  5 +++-
+ .../Source/core/events/MessageEvent.idl       |  2 +-
  4 files changed, 44 insertions(+), 18 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp b/third_party/WebKit/Source/bindings/core/v8/custom/V8MessageEventCustom.cpp
@@ -2187,18 +2187,18 @@ index b8a5265f1bf6..9fee731011dc 100644
      // TODO(bashi): |source| should be (WindowProxy or MessagePort)?
      readonly attribute EventTarget? source;
 -- 
-2.14.1
+2.17.1
 
 
 From c0d77e06e479c1005e39458030c4cb2ef32f4937 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Wed, 26 Apr 2017 11:24:52 -0400
-Subject: [PATCH 09/11] Modifying message tracking
+Subject: [PATCH 09/13] Modifying message tracking
 
 ---
- third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp   | 12 ++++++++++++
- .../Source/bindings/core/v8/custom/V8MessageEventCustom.cpp  |  4 +++-
- third_party/WebKit/Source/core/events/MessageEvent.h         |  5 ++++-
+ .../WebKit/Source/bindings/core/v8/WindowProxy.cpp   | 12 ++++++++++++
+ .../bindings/core/v8/custom/V8MessageEventCustom.cpp |  4 +++-
+ third_party/WebKit/Source/core/events/MessageEvent.h |  5 ++++-
  3 files changed, 19 insertions(+), 2 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
@@ -2278,25 +2278,25 @@ index f6de3b0cf17e..0d523425f038 100644
      static MessageEvent* create()
      {
 -- 
-2.14.1
+2.17.1
 
 
 From 0ebdd02c6dcfb9da4d528a94a86498aaa2c4aa55 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Wed, 21 Jun 2017 15:03:06 -0400
-Subject: [PATCH 10/11] Fixing bug where about:blank urls do not get updated
+Subject: [PATCH 10/13] Fixing bug where about:blank urls do not get updated
  when the document loads
 
 ---
- .../Source/bindings/core/v8/ScriptController.cpp   |  4 ++++
- .../Source/bindings/core/v8/ScriptController.h     |  1 +
- .../WebKit/Source/bindings/core/v8/WindowProxy.cpp | 25 ++++++++++++++--------
- .../WebKit/Source/bindings/core/v8/WindowProxy.h   |  2 ++
- third_party/WebKit/Source/core/dom/Document.cpp    |  3 +++
- third_party/WebKit/Source/core/frame/Location.cpp  | 12 +++++++++++
- third_party/WebKit/Source/core/page/FrameTree.cpp  |  5 +++++
- .../WebKit/Source/modules/storage/StorageArea.cpp  |  5 ++++-
- .../WebKit/Source/wtf/text/TaintTracking.cpp       | 20 +++++++++++++----
+ .../bindings/core/v8/ScriptController.cpp     |  4 +++
+ .../bindings/core/v8/ScriptController.h       |  1 +
+ .../Source/bindings/core/v8/WindowProxy.cpp   | 25 ++++++++++++-------
+ .../Source/bindings/core/v8/WindowProxy.h     |  2 ++
+ .../WebKit/Source/core/dom/Document.cpp       |  3 +++
+ .../WebKit/Source/core/frame/Location.cpp     | 12 +++++++++
+ .../WebKit/Source/core/page/FrameTree.cpp     |  5 ++++
+ .../Source/modules/storage/StorageArea.cpp    |  5 +++-
+ .../WebKit/Source/wtf/text/TaintTracking.cpp  | 20 ++++++++++++---
  9 files changed, 63 insertions(+), 14 deletions(-)
 
 diff --git a/third_party/WebKit/Source/bindings/core/v8/ScriptController.cpp b/third_party/WebKit/Source/bindings/core/v8/ScriptController.cpp
@@ -2511,13 +2511,13 @@ index b2a3ccdc5a32..1fa3c95b474e 100644
  
  }
 -- 
-2.14.1
+2.17.1
 
 
 From d32a31c70112cc8f87e063160f8f6fe97f151485 Mon Sep 17 00:00:00 2001
 From: William Melicher <wrmelicher@gmail.com>
 Date: Tue, 3 Oct 2017 14:31:33 -0400
-Subject: [PATCH 11/11] Uncommited file
+Subject: [PATCH 11/13] Uncommited file
 
 ---
  third_party/WebKit/Source/core/frame/Location.cpp | 11 ++++++++++-
@@ -2546,5 +2546,100 @@ index 60c1a3ec0db0..964c12cd2c32 100644
          return blankURL(); // Use "about:blank" while the page is still loading (before we have a frame).
  
 -- 
-2.14.1
+2.17.1
+
+
+From 367b11e8a29cd5a82381fd5dfa50133f03d11805 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Wed, 30 May 2018 13:45:12 -0400
+Subject: [PATCH 12/13] Fixing bug where adding a text element node to a script
+ is not checked
+
+---
+ third_party/WebKit/Source/core/html/HTMLScriptElement.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+index 07ddfdcbd99d..ecfdc3cb5848 100644
+--- a/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLScriptElement.cpp
+@@ -68,6 +68,8 @@ void HTMLScriptElement::childrenChanged(const ChildrenChange& change)
+     HTMLElement::childrenChanged(change);
+     if (change.isChildInsertion())
+         m_loader->childrenChanged();
++
++    LogIfTaintedNode(text(), 1, v8::String::TaintSinkLabel::JAVASCRIPT);
+ }
+ 
+ void HTMLScriptElement::didMoveToNewDocument(Document& oldDocument)
+-- 
+2.17.1
+
+
+From f5f0b02b865ec1adf43150291b0112b237f834ac Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Sun, 2 Dec 2018 16:17:10 -0500
+Subject: [PATCH 13/13] Adding sink type
+
+---
+ third_party/WebKit/Source/core/events/EventTarget.cpp | 5 +++++
+ third_party/WebKit/Source/core/events/EventTarget.h   | 3 +++
+ third_party/WebKit/Source/core/events/EventTarget.idl | 2 ++
+ third_party/WebKit/Source/wtf/text/TaintTracking.h    | 2 +-
+ 4 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/WebKit/Source/core/events/EventTarget.cpp b/third_party/WebKit/Source/core/events/EventTarget.cpp
+index 90bcd0ac657c..42561b426ce7 100644
+--- a/third_party/WebKit/Source/core/events/EventTarget.cpp
++++ b/third_party/WebKit/Source/core/events/EventTarget.cpp
+@@ -698,4 +698,9 @@ void EventTarget::removeAllEventListeners()
+     }
+ }
+ 
++// custom function by Rintaro
++Vector<AtomicString> EventTarget::internalSpecialNamespaceGetRegisteredEvents() {
++    return eventTypes();
++}
++
+ } // namespace blink
+diff --git a/third_party/WebKit/Source/core/events/EventTarget.h b/third_party/WebKit/Source/core/events/EventTarget.h
+index 0a2f3d60b2c5..ad0095ac9229 100644
+--- a/third_party/WebKit/Source/core/events/EventTarget.h
++++ b/third_party/WebKit/Source/core/events/EventTarget.h
+@@ -128,6 +128,9 @@ public:
+ 
+     DispatchEventResult dispatchEvent(Event*);
+ 
++    // custom function by Rintaro
++    Vector<AtomicString> internalSpecialNamespaceGetRegisteredEvents();
++
+     // dispatchEventForBindings is intended to only be called from
+     // javascript originated calls. This method will validate and may adjust
+     // the Event object before dispatching.
+diff --git a/third_party/WebKit/Source/core/events/EventTarget.idl b/third_party/WebKit/Source/core/events/EventTarget.idl
+index dcbe5fcb89c8..657f535efef1 100644
+--- a/third_party/WebKit/Source/core/events/EventTarget.idl
++++ b/third_party/WebKit/Source/core/events/EventTarget.idl
+@@ -27,4 +27,6 @@
+     [Custom=(CallPrologue,CallEpilogue)] void addEventListener(DOMString type, EventListener? listener, optional (AddEventListenerOptions or boolean) options);
+     [Custom=(CallPrologue,CallEpilogue)] void removeEventListener(DOMString type, EventListener? listener, optional (EventListenerOptions or boolean) options);
+     [ImplementedAs=dispatchEventForBindings, RaisesException] boolean dispatchEvent(Event event);
++    // custom function by Rintaro
++    sequence<DOMString> internalSpecialNamespaceGetRegisteredEvents();
+ };
+diff --git a/third_party/WebKit/Source/wtf/text/TaintTracking.h b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+index 8e7f9c1106f5..75a40b0d32d5 100644
+--- a/third_party/WebKit/Source/wtf/text/TaintTracking.h
++++ b/third_party/WebKit/Source/wtf/text/TaintTracking.h
+@@ -38,7 +38,7 @@ enum TaintType {
+   MULTIPLE_TAINTS = 18,
+   MESSAGE_ORIGIN = 19,
+ 
+-  MAX_TAINT_TYPE = 19,
++  MAX_TAINT_TYPE = 20,
+ 
+   URL_ENCODED = 32,           // 1 << 5
+   URL_COMPONENT_ENCODED = 64, // 2 << 5
+-- 
+2.17.1
 
