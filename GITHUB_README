@@ -1,0 +1,9 @@
+This source code is distributed as a set of patches to be applied to the
+Chromium source code. We chose this option because the cost of using the entire
+Chromium source code tree would be too high. To build from the patches, follow
+the directions in the "Checking out code" section of the TAINT_TRACKING_README
+document.
+
+Because of the difficulty with setting up a Chromium source code development
+environment from the past, on request, we can distribute a virtual machine with
+the development environment already set up.
